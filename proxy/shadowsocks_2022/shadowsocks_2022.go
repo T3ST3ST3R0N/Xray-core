@@ -2,6 +2,8 @@ package shadowsocks_2022
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -17,18 +19,44 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
+// udpReturnPath keeps the connection and authenticated high-water mark together.
+// Only a fully validated packet may move an authenticated session's return path.
+type udpReturnPath struct {
+	sync.RWMutex
+	conn     stat.Connection
+	packetID uint64
+}
+
+// UpdateConn is used only by relays, which cannot authenticate the inner payload.
 func (s *ServerUDPSession) UpdateConn(conn stat.Connection) {
-	s.currentConn.Store(conn)
-	s.timer.Update()
+	s.currentConn.Lock()
+	s.currentConn.conn = conn
+	s.currentConn.Unlock()
+	s.updateActivity()
+}
+
+func (s *ServerUDPSession) UpdateAuthenticatedConn(conn stat.Connection, packetID uint64) {
+	s.currentConn.Lock()
+	if s.currentConn.conn == nil || packetID > s.currentConn.packetID {
+		s.currentConn.conn = conn
+		s.currentConn.packetID = packetID
+	}
+	s.currentConn.Unlock()
+	s.updateActivity()
+}
+
+func (s *ServerUDPSession) updateActivity() {
+	s.LastActive.Store(time.Now().Unix())
+	if timer := s.timer.Load(); timer != nil {
+		timer.Update()
+	}
 }
 
 func (s *ServerUDPSession) WriteToClient(b []byte) error {
-	connVal := s.currentConn.Load()
-	if connVal == nil {
-		return errors.New("client connection closed")
-	}
-	conn, ok := connVal.(stat.Connection)
-	if !ok || conn == nil {
+	s.currentConn.RLock()
+	conn := s.currentConn.conn
+	s.currentConn.RUnlock()
+	if conn == nil {
 		return errors.New("client connection closed")
 	}
 	_, err := conn.Write(b)
@@ -36,8 +64,9 @@ func (s *ServerUDPSession) WriteToClient(b []byte) error {
 }
 
 func (s *ServerUDPSession) Close() {
-	if s.timer != nil {
-		s.timer.SetTimeout(0)
+	s.closed.Store(true)
+	if timer := s.timer.Load(); timer != nil {
+		timer.SetTimeout(0)
 	}
 	if link := s.link.Load(); link != nil {
 		common.Interrupt(link.Reader)
@@ -56,23 +85,26 @@ func (s *ServerUDPSession) EnsureLink(
 	s.Lock()
 	defer s.Unlock()
 
+	if s.closed.Load() {
+		return nil, errors.New("udp session closed")
+	}
 	if link := s.link.Load(); link != nil {
-		s.UpdateConn(conn)
 		return link, nil
 	}
 
-	s.currentConn.Store(conn)
-
 	sessCtx, cancel := context.WithCancel(ctx)
+	s.userMu.RLock()
+	user := s.User
+	s.userMu.RUnlock()
 	inbound := session.InboundFromContext(sessCtx)
-	if inbound != nil && s.User != nil {
-		inbound.User = s.User
+	if inbound != nil && user != nil {
+		inbound.User = user
 	}
 	var email string
 	var level uint32
-	if s.User != nil {
-		email = s.User.Email
-		level = s.User.Level
+	if user != nil {
+		email = user.Email
+		level = user.Level
 	}
 	sessCtx = log.ContextWithAccessMessage(sessCtx, &log.AccessMessage{
 		From:   conn.RemoteAddr(),
@@ -88,18 +120,25 @@ func (s *ServerUDPSession) EnsureLink(
 	}
 
 	sessionPolicy := policyManager.ForLevel(level)
-	s.timer = signal.CancelAfterInactivity(sessCtx, func() {
+	timer := signal.CancelAfterInactivity(sessCtx, func() {
 		if s.manager != nil {
-			s.manager.Delete(s.SessionID)
+			s.manager.Delete(s)
 		}
 		s.Close()
 		cancel()
 	}, sessionPolicy.Timeouts.ConnectionIdle)
+	s.timer.Store(timer)
 	s.link.Store(link)
-	if s.User != nil {
+	// Timeout or cleanup can win while Dispatch or timer creation is running.
+	if s.closed.Load() {
+		s.Close()
+		cancel()
+		return nil, errors.New("udp session closed")
+	}
+	if user != nil {
 		// Removing the user ends the session the way its idle timeout does.
-		stop := context.AfterFunc(s.User.Context(), func() {
-			s.timer.SetTimeout(0)
+		stop := context.AfterFunc(user.Context(), func() {
+			timer.SetTimeout(0)
 		})
 		context.AfterFunc(sessCtx, func() {
 			stop()
@@ -120,13 +159,13 @@ func ResetTCPConn(conn net.Conn) {
 }
 
 func handleUDPResponse(s *ServerUDPSession, link *transport.Link, fallbackDest net.Destination, encode func(dest net.Destination, payload []byte) ([]byte, error)) {
-	defer s.timer.SetTimeout(0)
+	defer s.Close()
 	for {
 		resMb, err := link.Reader.ReadMultiBuffer()
 		if err != nil {
 			return
 		}
-		s.timer.Update()
+		s.updateActivity()
 		for i, rb := range resMb {
 			b := rb.Bytes()
 			if encode != nil {

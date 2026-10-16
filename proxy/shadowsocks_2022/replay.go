@@ -83,6 +83,11 @@ type ServerUDPSession struct {
 	UserPSK    []byte
 	LastActive atomic.Int64 // Unix timestamp in seconds
 
+	// receiveMu protects cipher initialization and authenticated replay acceptance.
+	// It is never held during routing or packet writes.
+	receiveMu        sync.Mutex
+	replayMu         sync.Mutex
+	userMu           sync.RWMutex
 	clientBodyCipher cipher.AEAD
 
 	ServerSessionID   uint64
@@ -93,26 +98,27 @@ type ServerUDPSession struct {
 
 	manager     *UDPSessionManager
 	link        atomic.Pointer[transport.Link]
-	timer       *signal.ActivityTimer
-	currentConn atomic.Value // stores stat.Connection
+	timer       atomic.Pointer[signal.ActivityTimer]
+	currentConn udpReturnPath
+	closed      atomic.Bool
 }
 
 func (s *ServerUDPSession) CheckPacketID(packetID uint64) bool {
-	s.Lock()
-	defer s.Unlock()
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
 	if s.Window == nil {
 		s.Window = new(SlidingWindow)
 	}
 	return s.Window.Check(packetID)
 }
 
-func (s *ServerUDPSession) AddPacketID(packetID uint64) {
-	s.Lock()
-	defer s.Unlock()
+func (s *ServerUDPSession) AcceptPacketID(packetID uint64) bool {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
 	if s.Window == nil {
 		s.Window = new(SlidingWindow)
 	}
-	s.Window.Add(packetID)
+	return s.Window.CheckAndAdd(packetID)
 }
 
 type UDPSessionManager struct {
@@ -163,15 +169,17 @@ func (m *UDPSessionManager) cleanup(now int64) {
 	}
 	m.sessions.Range(func(k uint64, v *ServerUDPSession) bool {
 		if now-v.LastActive.Load() > timeoutSec {
-			m.sessions.Delete(k)
-			v.Close()
+			if m.sessions.CompareAndDelete(k, v) {
+				v.Close()
+			}
 		}
 		return true
 	})
 }
 
-func (m *UDPSessionManager) Delete(sessionID uint64) {
-	m.sessions.Delete(sessionID)
+func (m *UDPSessionManager) Delete(session *ServerUDPSession) {
+	// A late timeout must not delete a replacement with the same wire ID.
+	m.sessions.CompareAndDelete(session.SessionID, session)
 }
 
 func (m *UDPSessionManager) EncodeServerPacket(method *CipherMethod, psk []byte, clientSessionID uint64, dest net.Destination, payload []byte) ([]byte, error) {

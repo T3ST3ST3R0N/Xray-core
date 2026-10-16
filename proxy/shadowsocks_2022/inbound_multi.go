@@ -289,68 +289,22 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 		}
 
 		for _, b := range mb {
-			// In multi-user UDP:
-			// Packet header is 16 bytes: Encrypted(SessionID + PacketID)
-			// Followed by 16 bytes EIH
-			packetBytes := b.Bytes()
-			if len(packetBytes) < 32+1+8+2 {
-				b.Release()
-				continue
-			}
-
-			var rawHeader [16]byte
-			i.udpMasterCipher.Decrypt(rawHeader[:], packetBytes[:16])
-
-			sessionID := binary.BigEndian.Uint64(rawHeader[:8])
-			packetID := binary.BigEndian.Uint64(rawHeader[8:16])
-
-			sessionItem := i.udpSessions.GetOrCreate(sessionID)
-
-			if !sessionItem.CheckPacketID(packetID) {
-				b.Release()
-				continue
-			}
-
-			var userPSK []byte
-			var currentUser *protocol.MemoryUser
-			sessionItem.Lock()
-			currentUser = sessionItem.User
-			userPSK = sessionItem.UserPSK
-			sessionItem.Unlock()
-
-			if currentUser == nil {
-				// Decrypt EIH
-				decryptedHash := DecryptUDPEIH(i.udpMasterCipher, rawHeader[:], packetBytes[16:32])
-
-				user, ok := i.usersByHash.Load(decryptedHash)
-				if !ok {
-					b.Release()
-					continue
-				}
-				currentUser = user
-				userPSK = user.Account.(*MemoryAccount).Key
-			}
-
-			decoded, err := sessionItem.DecryptAESPayload(i.method, userPSK, sessionID, packetID, rawHeader[:], packetBytes[32:])
+			decoded, userPSK, err := i.decodeUDPPacket(b.Bytes())
 			b.Release()
 			if err != nil {
 				continue
 			}
-
-			sessionItem.Lock()
-			if sessionItem.User == nil {
-				sessionItem.User = currentUser
-				sessionItem.UserPSK = userPSK
-			}
-			sessionItem.Unlock()
-
+			sessionItem := decoded.session
+			sessionID := decoded.SessionID
+			sessionItem.UpdateAuthenticatedConn(conn, decoded.PacketID)
 			link := sessionItem.link.Load()
-			if link != nil {
-				sessionItem.UpdateConn(conn)
-			} else {
+			if link == nil {
 				var err error
 				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(replyDest net.Destination, payload []byte) ([]byte, error) {
-					return i.encodeServerUDPPacket(sessionID, userPSK, replyDest, payload)
+					if err := sessionItem.EnsureServerState(i.method, userPSK); err != nil {
+						return nil, err
+					}
+					return sessionItem.EncodeServerPacket(i.method, sessionID, replyDest, payload)
 				})
 				if err != nil {
 					continue
@@ -365,6 +319,39 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 	}
 }
 
-func (i *MultiUserInbound) encodeServerUDPPacket(clientSessionID uint64, userPSK []byte, dest net.Destination, payload []byte) ([]byte, error) {
-	return i.udpSessions.EncodeServerPacket(i.method, userPSK, clientSessionID, dest, payload)
+// decodeUDPPacket commits the authenticated cipher, replay state and user as
+// one receive operation. No dispatcher or packet writer is called under its lock.
+func (i *MultiUserInbound) decodeUDPPacket(packetBytes []byte) (DecodedUDPPacket, []byte, error) {
+	if len(packetBytes) < 32+1+8+2 {
+		return DecodedUDPPacket{}, nil, ErrPacketTooShort
+	}
+	var rawHeader [16]byte
+	i.udpMasterCipher.Decrypt(rawHeader[:], packetBytes[:16])
+	sessionID := binary.BigEndian.Uint64(rawHeader[:8])
+	packetID := binary.BigEndian.Uint64(rawHeader[8:])
+	s := i.udpSessions.GetOrCreate(sessionID)
+	s.receiveMu.Lock()
+	defer s.receiveMu.Unlock()
+	s.userMu.RLock()
+	user, userPSK := s.User, s.UserPSK
+	s.userMu.RUnlock()
+	if user == nil {
+		userHash := DecryptUDPEIH(i.udpMasterCipher, rawHeader[:], packetBytes[16:32])
+		var ok bool
+		user, ok = i.usersByHash.Load(userHash)
+		if !ok {
+			return DecodedUDPPacket{}, nil, ErrBadKey
+		}
+		userPSK = user.Account.(*MemoryAccount).Key
+	}
+	decoded, err := s.decryptAESPayload(i.method, userPSK, sessionID, packetID, rawHeader[:], packetBytes[32:])
+	if err != nil {
+		return DecodedUDPPacket{}, nil, err
+	}
+	s.userMu.Lock()
+	if s.User == nil {
+		s.User, s.UserPSK = user, userPSK
+	}
+	s.userMu.Unlock()
+	return decoded, userPSK, nil
 }

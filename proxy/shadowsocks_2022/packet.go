@@ -90,6 +90,8 @@ func (c *UDPCodec) GetSession(sessionID uint64) *ServerUDPSession {
 }
 
 type DecodedUDPPacket struct {
+	// Keep the authenticated generation instead of looking up its wire ID again.
+	session         *ServerUDPSession
 	SessionID       uint64
 	PacketID        uint64
 	HeaderType      byte
@@ -229,7 +231,10 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 			return DecodedUDPPacket{}, ErrBadHeaderType
 		}
 
-		sessionItem.AddPacketID(packetID)
+		if !sessionItem.AcceptPacketID(packetID) {
+			return DecodedUDPPacket{}, ErrPacketIdNotUnique
+		}
+		decoded.session = sessionItem
 		return decoded, nil
 	}
 
@@ -248,6 +253,17 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 }
 
 func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, sessionID, packetID uint64, rawHeader, bodyCipher []byte) (DecodedUDPPacket, error) {
+	s.receiveMu.Lock()
+	defer s.receiveMu.Unlock()
+	return s.decryptAESPayload(method, psk, sessionID, packetID, rawHeader, bodyCipher)
+}
+
+// decryptAESPayload requires receiveMu; multi-user callers retain that lock
+// until the authenticated cipher and its user identity have both been published.
+func (s *ServerUDPSession) decryptAESPayload(method *CipherMethod, psk []byte, sessionID, packetID uint64, rawHeader, bodyCipher []byte) (DecodedUDPPacket, error) {
+	if !s.CheckPacketID(packetID) {
+		return DecodedUDPPacket{}, ErrPacketIdNotUnique
+	}
 	bodyAead := s.clientBodyCipher
 	isNewCipher := false
 	if bodyAead == nil {
@@ -275,12 +291,15 @@ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, s
 		return DecodedUDPPacket{}, ErrBadHeaderType
 	}
 
-	s.AddPacketID(packetID)
+	if !s.AcceptPacketID(packetID) {
+		return DecodedUDPPacket{}, ErrPacketIdNotUnique
+	}
 
 	if isNewCipher {
 		s.clientBodyCipher = bodyAead
 	}
 
+	decoded.session = s
 	return decoded, nil
 }
 
