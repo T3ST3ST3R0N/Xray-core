@@ -4,33 +4,34 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"net/netip"
-	"runtime"
-	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/xtls/xray-core/common/errors"
+	dnsapp "github.com/xtls/xray-core/app/dns"
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/crypto/curve25519"
 )
 
-type testDNS struct {
-	fail atomic.Bool
-	ips  []net.IP
-}
+type testDNS struct{ ips []net.IP }
 
 func (*testDNS) Type() interface{} { return dns.ClientType() }
 func (*testDNS) Start() error      { return nil }
 func (*testDNS) Close() error      { return nil }
 func (d *testDNS) LookupIP(string, dns.IPOption) ([]net.IP, uint32, error) {
-	if d.fail.Load() {
-		return nil, 0, errors.New("lookup failed")
-	}
 	return d.ips, 600, nil
 }
+
+// untagged is the outbound handler NewClient reads its tag from.
+type untagged struct{ outbound.Handler }
+
+func (untagged) Tag() string { return "" }
 
 func testKey(t *testing.T) (priv, pub string) {
 	var k [32]byte
@@ -44,60 +45,32 @@ func testKey(t *testing.T) (priv, pub string) {
 	return hex.EncodeToString(k[:]), hex.EncodeToString(p)
 }
 
-func newTestClient(t *testing.T, endpoint string, d *testDNS) *Handler {
-	t.Helper()
-	priv, _ := testKey(t)
-	_, peerPub := testKey(t)
-	tun, tnet, _, err := CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.0.0.2")}, nil, 1420, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := &Handler{
-		conf: &DeviceConfig{
-			SecretKey: priv,
-			Peers:     []*PeerConfig{{PublicKey: peerPub, Endpoint: endpoint, AllowedIps: []string{"0.0.0.0/0"}}},
-		},
-		dns:            d,
-		streamSettings: &internet.MemoryStreamConfig{},
-		tun:            tun,
-		tnet:           tnet,
-	}
-	t.Cleanup(func() { h.Close() })
-	return h
-}
-
-// A failed init must not leave a device behind: each one reads the shared
-// TUN, so after a later successful init the leftovers would take packets
-// meant for the working device.
-func TestClientInitRetryKeepsOneDevice(t *testing.T) {
-	d := &testDNS{ips: []net.IP{net.ParseIP("127.0.0.1")}}
-	d.fail.Store(true)
-	h := newTestClient(t, "localhost:51820", d)
-
-	if err := h.init(context.Background()); err == nil {
-		t.Fatal("init succeeded although the endpoint does not resolve")
-	}
-	time.Sleep(100 * time.Millisecond)
-	before := runtime.NumGoroutine()
-	for i := 0; i < 5; i++ {
-		if err := h.init(context.Background()); err == nil {
-			t.Fatal("init succeeded although the endpoint does not resolve")
-		}
-	}
-	time.Sleep(100 * time.Millisecond)
-	if n := runtime.NumGoroutine(); n > before+runtime.NumCPU() {
-		t.Fatalf("goroutines grew from %d to %d over 5 failed inits", before, n)
-	}
-	d.fail.Store(false)
-	if err := h.init(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // The bind socket must come up for an endpoint that only Xray's DNS knows.
 func TestClientEndpointResolvedByXrayDNS(t *testing.T) {
-	h := newTestClient(t, "wg.test:51820", &testDNS{ips: []net.IP{net.ParseIP("127.0.0.1")}})
-	if err := h.init(context.Background()); err != nil {
+	v, err := core.New(&core.Config{App: []*serial.TypedMessage{serial.ToTypedMessage(&dnsapp.Config{
+		StaticHosts: []*dnsapp.Config_HostMapping{{
+			Domain: &geodata.DomainRule{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "wg.test"}}},
+			Ip:     [][]byte{{127, 0, 0, 1}},
+		}},
+	})}})
+	common.Must(err)
+	ctx := context.WithValue(context.Background(), core.XrayKey(1), v)
+	ctx = session.ContextWithStreamSettings(ctx, &internet.MemoryStreamConfig{})
+	ctx = session.ContextWithFullHandler(ctx, untagged{})
+
+	priv, _ := testKey(t)
+	_, peerPub := testKey(t)
+	h, err := NewClient(ctx, &DeviceConfig{
+		IsClient:    true,
+		NoKernelTun: true,
+		SecretKey:   priv,
+		Endpoint:    []string{"10.0.0.2"},
+		Mtu:         1420,
+		Peers:       []*PeerConfig{{PublicKey: peerPub, Endpoint: "wg.test:51820", AllowedIps: []string{"0.0.0.0/0"}}},
+	})
+	common.Must(err)
+	t.Cleanup(func() { h.Close() })
+	if err := h.up(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -106,12 +79,9 @@ func TestClientEndpointResolvedByXrayDNS(t *testing.T) {
 // resolve to the IPv6 address at random: hosts without IPv6 would then never
 // reach the relay.
 func TestResolveLocalPrefersIPv4(t *testing.T) {
-	h := &Handler{
-		dns:            &testDNS{ips: []net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("192.0.2.1")}},
-		streamSettings: &internet.MemoryStreamConfig{},
-	}
+	resolve := MakeResolveLocal(&testDNS{ips: []net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("192.0.2.1")}}, &internet.MemoryStreamConfig{})
 	for i := 0; i < 50; i++ {
-		ip, err := h.resolveLocal("relay.test")
+		ip, err := resolve("relay.test")
 		if err != nil {
 			t.Fatal(err)
 		}

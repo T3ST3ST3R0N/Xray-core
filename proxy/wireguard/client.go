@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -31,19 +32,14 @@ import (
 )
 
 type Handler struct {
-	conf          *DeviceConfig
-	policyManager policy.Manager
-	dns           dns.Client
+	p policy.Manager
 
-	streamSettings  *internet.MemoryStreamConfig
-	uplinkCounter   stats.Counter
-	downlinkCounter stats.Counter
-
-	tun        tun.Device
-	tnet       *Net
-	dev        *device.Device
-	configured bool
-	mu         sync.Mutex
+	canup *atomic.Bool
+	tnet  *Net
+	bind  *bind
+	dev   *device.Device
+	ipc   string
+	mu    sync.Mutex
 }
 
 func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
@@ -118,24 +114,101 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		errors.LogWarning(context.Background(), "Using kernel TUN")
 		tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))
 	} else {
-		errors.LogWarning(context.Background(), "Using gVisor TUN")
-		tun, tnet, _, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), true)
+		errors.LogWarning(context.Background(), "Using built-in TCP/IP stack")
+		tun, tnet, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), nil)
 	}
 	if err != nil {
 		return nil, err
 	}
 
+	blockup := newblockup(tun)
+	bind := &bind{}
+	logger := &device.Logger{
+		Verbosef: func(format string, args ...any) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Debug,
+				Content:  fmt.Sprintf(format, args...),
+			})
+		},
+		Errorf: func(format string, args ...any) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Error,
+				Content:  fmt.Sprintf(format, args...),
+			})
+		},
+	}
+	dev := device.NewDevice(blockup, bind, logger)
+	bind.ctx = context.Background()
+	bind.resolveFunc = MakeResolveLocal(d, streamSettings)
+	bind.listenFunc = func(ctx context.Context) (net.PacketConn, error) {
+		dest, err := net.ParseDestination("udp:" + conf.Peers[0].Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		// Resolve like the peer endpoints, with Xray's DNS, not the system's.
+		if dest.Address.Family().IsDomain() {
+			ip, err := bind.resolveFunc(dest.Address.Domain())
+			if err != nil {
+				return nil, err
+			}
+			dest.Address = net.IPAddress(ip)
+		}
+		var pktConn net.PacketConn
+		if streamSettings.FinalMask != nil {
+			conn, err := streamSettings.FinalMask.DialUDP(ctx, dest)
+			if err != nil {
+				return nil, errors.New("failed to dial to dest").Base(err)
+			}
+			pktConn = conn.(*net.PacketConnWrapper).PacketConn
+		} else {
+			conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+			if err != nil {
+				return nil, errors.New("failed to dial to dest").Base(err)
+			}
+			switch c := conn.(type) {
+			case *net.PacketConnWrapper:
+				pktConn = c.PacketConn
+			case *cnc.Connection:
+				pktConn = &internet.FakePacketConn{Conn: c}
+			default:
+				panic(reflect.TypeOf(c))
+			}
+		}
+		if uplinkCounter != nil || downlinkCounter != nil {
+			pktConn = &PacketCounterConnection{
+				PacketConn:   pktConn,
+				ReadCounter:  downlinkCounter,
+				WriteCounter: uplinkCounter,
+			}
+		}
+		return pktConn, nil
+	}
+	bind.downFunc = dev.Down
+	bind.reserved = conf.Reserved
+	var cfg strings.Builder
+	cfg.WriteString("private_key=" + conf.SecretKey + "\n")
+	for _, peer := range conf.Peers {
+		cfg.WriteString("public_key=" + peer.PublicKey + "\n")
+		if peer.PreSharedKey != "" {
+			cfg.WriteString("preshared_key=" + peer.PreSharedKey + "\n")
+		}
+		cfg.WriteString("endpoint=" + peer.Endpoint + "\n")
+		for _, ip := range peer.AllowedIps {
+			cfg.WriteString("allowed_ip=" + ip + "\n")
+		}
+		if peer.KeepAlive != "" {
+			cfg.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
+		}
+	}
+
 	return &Handler{
-		conf:          conf,
-		policyManager: p,
-		dns:           d,
+		p: p,
 
-		streamSettings:  streamSettings,
-		uplinkCounter:   uplinkCounter,
-		downlinkCounter: downlinkCounter,
-
-		tun:  tun,
-		tnet: tnet,
+		canup: blockup.canup,
+		tnet:  tnet,
+		bind:  bind,
+		dev:   dev,
+		ipc:   cfg.String(),
 	}, nil
 }
 
@@ -150,7 +223,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.CanSpliceCopy = 3
 	dialer.SetOutboundGateway(ctx, ob)
 
-	if err := h.init(ctx); err != nil {
+	if err := h.up(ctx); err != nil {
 		return err
 	}
 
@@ -160,7 +233,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		newCtx, newCancel = context.WithCancel(context.Background())
 	}
 
-	sessionPolicy := h.policyManager.ForLevel(0)
+	sessionPolicy := h.p.ForLevel(0)
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, func() {
 		cancel()
@@ -235,165 +308,74 @@ func (h *Handler) Close() (err error) {
 	if h.dev != nil {
 		h.dev.Close()
 		h.dev = nil
-		h.tun = nil
-	} else if h.tun != nil {
-		h.tun.Close()
-		h.tun = nil
 	}
 	return nil
 }
 
-func (h *Handler) init(ctx context.Context) error {
+func (h *Handler) up(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.tun == nil {
+	if h.dev == nil {
 		return errors.New("closed")
 	}
-	if h.dev != nil {
-		return h.configure()
+	h.bind.SetCtx(ctx)
+	if !h.canup.Load() {
+		h.canup.Store(true)
 	}
-	resolveFunc := h.resolveLocal
-	listenFunc := func() (net.PacketConn, error) {
-		dest, err := net.ParseDestination("udp:" + h.conf.Peers[0].Endpoint)
-		if err != nil {
-			return nil, err
+	if len(h.ipc) > 0 {
+		if err := h.dev.IpcSet(h.ipc); err != nil {
+			return err
 		}
-		// Resolve like the peer endpoints, with Xray's DNS, not the system's.
-		if dest.Address.Family().IsDomain() {
-			ip, err := h.resolveLocal(dest.Address.Domain())
-			if err != nil {
-				return nil, err
-			}
-			dest.Address = net.IPAddress(ip)
-		}
-		var pktConn net.PacketConn
-		if h.streamSettings.FinalMask != nil {
-			conn, err := h.streamSettings.FinalMask.DialUDP(ctx, dest)
-			if err != nil {
-				return nil, errors.New("failed to dial to dest").Base(err)
-			}
-			pktConn = conn.(*net.PacketConnWrapper).PacketConn
-		} else {
-			conn, err := internet.DialSystem(ctx, dest, h.streamSettings.SocketSettings)
-			if err != nil {
-				return nil, errors.New("failed to dial to dest").Base(err)
-			}
-			switch c := conn.(type) {
-			case *net.PacketConnWrapper:
-				pktConn = c.PacketConn
-			case *cnc.Connection:
-				pktConn = &internet.FakePacketConn{Conn: c}
-			default:
-				panic(reflect.TypeOf(c))
-			}
-		}
-		if h.uplinkCounter != nil || h.downlinkCounter != nil {
-			pktConn = &PacketCounterConnection{
-				PacketConn:   pktConn,
-				ReadCounter:  h.downlinkCounter,
-				WriteCounter: h.uplinkCounter,
-			}
-		}
-		return pktConn, nil
+		h.ipc = ""
 	}
-	// device.NewDevice may use the bind right away (Up -> BindUpdate -> Open),
-	// so everything it reads must be set before creating the device.
-	bind := &bind{
-		resolveFunc: resolveFunc,
-		listenFunc:  listenFunc,
-		reserved:    h.conf.Reserved,
-	}
-	logger := &device.Logger{
-		Verbosef: func(format string, args ...any) {
-			log.Record(&log.GeneralMessage{
-				Severity: log.Severity_Debug,
-				Content:  fmt.Sprintf(format, args...),
-			})
-		},
-		Errorf: func(format string, args ...any) {
-			log.Record(&log.GeneralMessage{
-				Severity: log.Severity_Error,
-				Content:  fmt.Sprintf(format, args...),
-			})
-		},
-	}
-	// The device takes over h.tun, so it is kept even if configure fails, and
-	// the next call retries.
-	h.dev = device.NewDevice(h.tun, bind, logger)
-	bind.setDownFunc(h.dev.Down)
-	return h.configure()
-}
-
-// configure applies the peers once and brings the device up.
-func (h *Handler) configure() error {
-	if h.configured {
-		return h.dev.Up()
-	}
-	var cfg strings.Builder
-	cfg.WriteString("private_key=" + h.conf.SecretKey + "\n")
-	for _, peer := range h.conf.Peers {
-		cfg.WriteString("public_key=" + peer.PublicKey + "\n")
-		if peer.PreSharedKey != "" {
-			cfg.WriteString("preshared_key=" + peer.PreSharedKey + "\n")
-		}
-		cfg.WriteString("endpoint=" + peer.Endpoint + "\n")
-		for _, ip := range peer.AllowedIps {
-			cfg.WriteString("allowed_ip=" + ip + "\n")
-		}
-		if peer.KeepAlive != "" {
-			cfg.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
-		}
-	}
-	if err := h.dev.IpcSet(cfg.String()); err != nil {
-		return err
-	}
-	h.configured = true
 	return h.dev.Up()
 }
 
-func (h *Handler) resolveLocal(host string) (net.IP, error) {
-	if ip := net.ParseIP(host); ip != nil {
-		return ip, nil
-	}
-	ips, _, err := h.dns.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
-	if err != nil {
-		return nil, err
-	}
-	var got4, got6 []net.IP
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			got4 = append(got4, ip)
-		} else {
-			got6 = append(got6, ip)
+func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig) func(host string) (net.IP, error) {
+	return func(host string) (net.IP, error) {
+		if ip := net.ParseIP(host); ip != nil {
+			return ip, nil
 		}
-	}
-	strategy := internet.DomainStrategy_AS_IS
-	if h.streamSettings.SocketSettings != nil {
-		strategy = h.streamSettings.SocketSettings.DomainStrategy
-	}
-	got := ips
-	switch strategy {
-	case internet.DomainStrategy_USE_IP4, internet.DomainStrategy_FORCE_IP4:
-		got = got4
-	case internet.DomainStrategy_USE_IP6, internet.DomainStrategy_FORCE_IP6:
-		got = got6
-	case internet.DomainStrategy_AS_IS, internet.DomainStrategy_USE_IP46, internet.DomainStrategy_FORCE_IP46:
-		// Not a random family for AsIs: the endpoint is resolved once, and an
-		// IPv6 pick on a host without IPv6 leaves the tunnel down.
-		got = got4
-		if len(got) == 0 {
-			got = got6
+		ips, _, err := d.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
+		if err != nil {
+			return nil, err
 		}
-	case internet.DomainStrategy_USE_IP64, internet.DomainStrategy_FORCE_IP64:
-		got = got6
-		if len(got) == 0 {
+		var got4, got6 []net.IP
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				got4 = append(got4, ip)
+			} else {
+				got6 = append(got6, ip)
+			}
+		}
+		strategy := internet.DomainStrategy_AS_IS
+		if streamSettings.SocketSettings != nil {
+			strategy = streamSettings.SocketSettings.DomainStrategy
+		}
+		got := ips
+		switch strategy {
+		case internet.DomainStrategy_USE_IP4, internet.DomainStrategy_FORCE_IP4:
 			got = got4
+		case internet.DomainStrategy_USE_IP6, internet.DomainStrategy_FORCE_IP6:
+			got = got6
+		case internet.DomainStrategy_AS_IS, internet.DomainStrategy_USE_IP46, internet.DomainStrategy_FORCE_IP46:
+			// Not a random family for AsIs: the endpoint is resolved once, and an
+			// IPv6 pick on a host without IPv6 leaves the tunnel down.
+			got = got4
+			if len(got) == 0 {
+				got = got6
+			}
+		case internet.DomainStrategy_USE_IP64, internet.DomainStrategy_FORCE_IP64:
+			got = got6
+			if len(got) == 0 {
+				got = got4
+			}
 		}
+		if len(got) == 0 {
+			return nil, dns.ErrEmptyResponse
+		}
+		return got[dice.Roll(len(got))], nil
 	}
-	if len(got) == 0 {
-		return nil, dns.ErrEmptyResponse
-	}
-	return got[dice.Roll(len(got))], nil
 }
 
 type UDPConnClient struct {
@@ -525,4 +507,32 @@ func (c *cache) Cache(host string, saddr []string, ttl uint32) {
 		saddr:    saddr,
 		deadline: time.Now().Add(time.Second * time.Duration(ttl)),
 	}
+}
+
+type blockup struct {
+	tun.Device
+	ch    chan tun.Event
+	canup *atomic.Bool
+}
+
+func newblockup(t tun.Device) *blockup {
+	ch := make(chan tun.Event, cap(t.Events()))
+	canup := &atomic.Bool{}
+	go func() {
+		for e := range t.Events() {
+			if e&tun.EventUp != 0 && !canup.Load() {
+				continue
+			}
+			select {
+			case ch <- e:
+			default:
+			}
+		}
+		close(ch)
+	}()
+	return &blockup{Device: t, ch: ch, canup: canup}
+}
+
+func (b *blockup) Events() <-chan tun.Event {
+	return b.ch
 }

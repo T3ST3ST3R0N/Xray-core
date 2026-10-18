@@ -36,8 +36,9 @@ type batchConn interface {
 }
 
 type bind struct {
+	ctx         context.Context
 	resolveFunc func(host string) (net.IP, error)
-	listenFunc  func() (net.PacketConn, error)
+	listenFunc  func(ctx context.Context) (net.PacketConn, error)
 	downFunc    func() error
 	reserved    []byte
 
@@ -53,6 +54,12 @@ type bind struct {
 	mu           sync.Mutex
 }
 
+func (b *bind) SetCtx(ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ctx = ctx
+}
+
 func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -61,7 +68,7 @@ func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err
 		return nil, 0, conn.ErrBindAlreadyOpen
 	}
 
-	c, err := b.listenFunc()
+	c, err := b.listenFunc(b.ctx)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -84,12 +91,9 @@ func (b *bind) readFailed(err error, ch chan struct{}) bool {
 		case <-ch:
 		default:
 			errors.LogErrorInner(context.Background(), err, "unexpected closed")
-			b.mu.Lock()
-			downFunc := b.downFunc
-			b.mu.Unlock()
-			if downFunc != nil {
+			if b.downFunc != nil {
 				go func() {
-					common.Must(downFunc())
+					common.Must(b.downFunc())
 				}()
 			}
 		}
@@ -161,13 +165,6 @@ func (b *bind) makeReceiveBatch(bc batchConn, ch chan struct{}) conn.ReceiveFunc
 			return n, nil
 		}
 	}
-}
-
-// setDownFunc sets downFunc after the device is created, since the device may already be using the bind.
-func (b *bind) setDownFunc(f func() error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.downFunc = f
 }
 
 func (b *bind) Close() error {

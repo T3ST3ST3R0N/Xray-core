@@ -10,7 +10,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -19,105 +18,62 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	xtun "github.com/xtls/xray-core/proxy/tun"
 	"golang.zx2c4.com/wireguard/tun"
 
 	"golang.org/x/net/dns/dnsmessage"
-	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
+// netTunQueue is how many packets of the stack can wait to be read from its device
+const netTunQueue = 1024
+
+// netTun is the device of a TCP/IP stack of Xray: what is written to it goes to the stack,
+// and what the stack sends is read from it
 type netTun struct {
-	ep           *channel.Endpoint
-	stack        *stack.Stack
-	events       chan tun.Event
-	notifyHandle *channel.NotificationHandle
-	mu           sync.Mutex
-	drained      *sync.Cond // Read took packets, or the tun closed
-	closed       bool
-	mtu          int
-	dnsServers   []netip.Addr
-	hasV4, hasV6 bool
+	stack  xtun.Stack
+	events chan tun.Event
+	// packets are what the stack has sent and Read has not taken yet
+	packets   chan *buf.Buffer
+	closed    chan struct{}
+	closeOnce sync.Once
+	mtu       int
 }
 
-// maxQueued is how many outbound packets may wait for wireguard-go before the
-// stack's senders wait too, so they do not overflow the endpoint's queue.
-const maxQueued = 256
-
-func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal bool) (tun.Device, *Net, *stack.Stack, error) {
-	opts := stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
-		HandleLocal:        handleLocal,
-	}
+// CreateNetTUN returns a device with a TCP/IP stack on it, and what opens connections through that from
+// localAddresses. With a handler the stack takes every connection that comes from the device, for any address.
+// Without one it takes none
+func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handler xtun.ConnectionHandler) (tun.Device, *Net, error) {
 	dev := &netTun{
-		ep:         channel.New(1024, uint32(mtu), ""),
-		stack:      stack.New(opts),
-		events:     make(chan tun.Event, 10),
-		dnsServers: dnsServers,
-		mtu:        mtu,
+		events:  make(chan tun.Event, 10),
+		packets: make(chan *buf.Buffer, netTunQueue),
+		closed:  make(chan struct{}),
+		mtu:     mtu,
 	}
-	dev.drained = sync.NewCond(&dev.mu)
-	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
-	tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
-	if tcpipErr != nil {
-		return nil, nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
+	stack, err := xtun.NewStack(context.Background(), xtun.StackOptions{Tun: dev, MTU: uint32(mtu), Addresses: localAddresses, Remote: true}, handler)
+	if err != nil {
+		return nil, nil, err
 	}
-	dev.notifyHandle = dev.ep.AddNotify(dev)
-	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
-	if tcpipErr != nil {
-		return nil, nil, nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
-	}
-	for _, ip := range localAddresses {
-		var protoNumber tcpip.NetworkProtocolNumber
-		if ip.Is4() {
-			protoNumber = ipv4.ProtocolNumber
-		} else if ip.Is6() {
-			protoNumber = ipv6.ProtocolNumber
-		}
-		protoAddr := tcpip.ProtocolAddress{
-			Protocol:          protoNumber,
-			AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
-		}
-		tcpipErr := dev.stack.AddProtocolAddress(1, protoAddr, stack.AddressProperties{})
-		if tcpipErr != nil {
-			return nil, nil, nil, fmt.Errorf("AddProtocolAddress(%v): %v", ip, tcpipErr)
-		}
-		if ip.Is4() {
-			dev.hasV4 = true
-		} else if ip.Is6() {
-			dev.hasV6 = true
-		}
-	}
-	if dev.hasV4 {
-		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: 1})
-	}
-	if dev.hasV6 {
-		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: 1})
-	}
+	dev.stack = stack
 
 	tnet := &Net{
-		DialContextTCPAddrPort: dev.DialContextTCPAddrPort,
+		DialContextTCPAddrPort: stack.DialTCP,
 		DialUDPAddrPort:        dev.DialUDPAddrPort,
-		dnsServers:             dev.dnsServers,
-		hasV4:                  dev.hasV4,
-		hasV6:                  dev.hasV6,
+		dnsServers:             dnsServers,
+	}
+	for _, ip := range localAddresses {
+		if ip.Is4() {
+			tnet.hasV4 = true
+		} else if ip.Is6() {
+			tnet.hasV6 = true
+		}
 	}
 
 	dev.events <- tun.EventUp
-	return dev, tnet, dev.stack, nil
+	return dev, tnet, nil
 }
 
 func (tun *netTun) Name() (string, error) {
@@ -132,79 +88,63 @@ func (tun *netTun) Events() <-chan tun.Event {
 	return tun.events
 }
 
-// Read copies the packets the stack has queued into buf, waiting for the
-// first one, so that wireguard-go can encrypt and send them as a batch.
 func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
-	n := 0
-	for pkt := tun.ep.ReadContext(context.Background()); pkt != nil; pkt = tun.ep.Read() {
-		size := 0
-		for _, s := range pkt.AsSlices() {
-			size += copy(buf[n][offset+size:], s)
-		}
-		pkt.DecRef()
-		sizes[n] = size
-		n++
-		if n == len(buf) {
-			break
-		}
-	}
-	if n == 0 {
+	select {
+	case packet := <-tun.packets:
+		sizes[0] = copy(buf[0][offset:], packet.Bytes())
+		packet.Release()
+		return 1, nil
+	case <-tun.closed:
 		return 0, os.ErrClosed
 	}
-	tun.mu.Lock()
-	tun.drained.Broadcast()
-	tun.mu.Unlock()
-	return n, nil
 }
 
 func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 	for _, buf := range buf {
-		packet := buf[offset:]
-		if len(packet) == 0 {
-			continue
-		}
-
-		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
-		switch packet[0] >> 4 {
-		case 4:
-			tun.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
-		case 6:
-			tun.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
-		default:
-			return 0, syscall.EAFNOSUPPORT
-		}
+		tun.stack.Input(buf[offset:])
 	}
 	return len(buf), nil
 }
 
-// WriteNotify runs in the goroutine that queued a packet and holds it while
-// the queue is long.
-func (tun *netTun) WriteNotify() {
-	if tun.ep.NumQueued() < maxQueued {
-		return
+// WritePacket implements xtun.Tun. The packet is in the hands of the stack only until this returns, so it is copied
+// for Read. The stack does not wait for the one who reads the device, unless that one is far behind: it answers
+// what it is written inside Write, and whoever writes would wait with it and lose what comes meanwhile
+func (tun *netTun) WritePacket(header, payload []byte) error {
+	packet := buf.NewWithSize(int32(len(header) + len(payload)))
+	packet.Write(header)
+	packet.Write(payload)
+	select {
+	case tun.packets <- packet:
+		return nil
+	case <-tun.closed:
+		packet.Release()
+		return os.ErrClosed
 	}
-	tun.mu.Lock()
-	for tun.ep.NumQueued() >= maxQueued && !tun.closed {
-		tun.drained.Wait()
-	}
-	tun.mu.Unlock()
+}
+
+// ReadPacket implements xtun.Tun. It is not called: the packets are handed to the stack by Write
+func (tun *netTun) ReadPacket([]byte) ([]byte, error) {
+	<-tun.closed
+	return nil, os.ErrClosed
+}
+
+// Start implements xtun.Tun
+func (tun *netTun) Start() error {
+	return nil
+}
+
+// Index implements xtun.Tun
+func (tun *netTun) Index() (int, error) {
+	return 0, nil
 }
 
 func (tun *netTun) Close() error {
-	tun.mu.Lock()
-	tun.closed = true
-	tun.drained.Broadcast()
-	tun.mu.Unlock()
-
-	tun.stack.RemoveNIC(1)
-	tun.stack.Close()
-	tun.ep.RemoveNotify(tun.notifyHandle)
-	tun.ep.Close()
-
-	if tun.events != nil {
+	tun.closeOnce.Do(func() {
+		// before the stack ends its connections: nobody may be reading anymore what it writes for that
+		close(tun.closed)
+		tun.stack.Close()
 		close(tun.events)
-	}
-
+	})
 	return nil
 }
 
@@ -216,17 +156,8 @@ func (tun *netTun) BatchSize() int {
 	return 1
 }
 
-func (tun *netTun) DialContextTCPAddrPort(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
-	fa, pn := convertToFullAddr(addr)
-	return gonet.DialContextTCP(ctx, tun.stack, fa, pn)
-}
-
 func (tun *netTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (net.Conn, error) {
-	var pn tcpip.NetworkProtocolNumber = ipv6.ProtocolNumber
-	if raddr.IsValid() || raddr.Port() > 0 {
-		_, pn = convertToFullAddr(raddr)
-	}
-	conn, err := gonet.DialUDP(tun.stack, nil, nil, pn)
+	conn, err := tun.stack.DialUDP()
 	if err != nil {
 		return nil, err
 	}
@@ -242,20 +173,6 @@ type Net struct {
 	dnsServers             []netip.Addr
 	hasV4, hasV6           bool
 	cache                  cache
-}
-
-func convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
-	var protoNumber tcpip.NetworkProtocolNumber
-	if endpoint.Addr().Is4() {
-		protoNumber = ipv4.ProtocolNumber
-	} else {
-		protoNumber = ipv6.ProtocolNumber
-	}
-	return tcpip.FullAddress{
-		NIC:  1,
-		Addr: tcpip.AddrFromSlice(endpoint.Addr().AsSlice()),
-		Port: endpoint.Port(),
-	}, protoNumber
 }
 
 var (
@@ -461,6 +378,8 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 				return dnsmessage.Parser{}, dnsmessage.Header{}, err
 			}
 		}
+		// what is opened through the stack of Xray takes no deadline, it ends when it is closed
+		stop := context.AfterFunc(ctx, func() { c.Close() })
 		var p dnsmessage.Parser
 		var h dnsmessage.Header
 		if useUDP {
@@ -468,8 +387,15 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 		} else {
 			p, h, err = dnsStreamRoundTrip(c, id, q, tcpReq)
 		}
+		stop()
 		c.Close()
 		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				// as from a connection that takes a deadline
+				err = &net.OpError{Op: "read", Net: c.RemoteAddr().Network(), Err: os.ErrDeadlineExceeded}
+			} else if ctx.Err() != nil {
+				err = ctx.Err()
+			}
 			if err == context.Canceled {
 				err = errCanceled
 			} else if err == context.DeadlineExceeded {

@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"net/netip"
 	"os"
@@ -27,7 +28,7 @@ func openTestBind(t *testing.T, network, addr string, reserved []byte) (*bind, c
 	rc, wc := &testCounter{}, &testCounter{}
 	b := &bind{
 		reserved: reserved,
-		listenFunc: func() (net.PacketConn, error) {
+		listenFunc: func(context.Context) (net.PacketConn, error) {
 			c, err := net.ListenPacket(network, addr)
 			if err != nil {
 				return nil, err
