@@ -163,6 +163,8 @@ func TestClientWorkerUDPSource(t *testing.T) {
 	}
 }
 
+// Keep the nil-parent default and worker teardown contract covered independently
+// of the transport writer optimizations in PR #4.
 func TestDialingWorkerFactoryNilContext(t *testing.T) {
 	mockCtl := gomock.NewController(t)
 	defer mockCtl.Finish()

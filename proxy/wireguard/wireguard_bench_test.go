@@ -3,6 +3,7 @@ package wireguard
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -18,14 +19,16 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/checksum"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
-// Throughput runs only when explicitly requested, for example:
-// go test ./proxy/wireguard -run '^$' -bench 'Benchmark(WireGuardTCP|NetTUNWriteRead|BindUDP|UDPManagerSteadyState|WriteRawUDPPacket)$' -benchmem
+// Throughput is opt-in; ordinary regression tests do not run these benchmarks:
+// go test ./proxy/wireguard -run '^$' -bench 'Benchmark(WireGuardTCP|NetTUNWriteRead|BindUDP)$' -benchmem
+//
+// WireGuardTCP uses two real WireGuard devices, native loopback UDP binds, and
+// proxy/tun TCP stacks via CreateNetTUN. NetTUNWriteRead isolates the device
+// adapter and ICMP stack path, without encryption or a privileged OS interface.
+// The current UDP queue microbenchmarks live in proxy/tun, not WireGuard:
+// go test ./proxy/tun -run '^$' -bench 'BenchmarkQueue(Burst|Stream)(Chan|PacketQueue)$' -benchmem
 const throughputPacketSize = 1200
 
 func benchmarkBuffers(count, size int) ([][]byte, []int, []conn.Endpoint) {
@@ -36,30 +39,30 @@ func benchmarkBuffers(count, size int) ([][]byte, []int, []conn.Endpoint) {
 	return bufs, make([]int, count), make([]conn.Endpoint, count)
 }
 
-func newThroughputTUN(tb testing.TB) *netTun {
+func newThroughputTUN(tb testing.TB) tun.Device {
 	tb.Helper()
-	dev, _, s, err := CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.66.0.1")}, nil, 1420, false)
+	dev, _, err := CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.66.0.1")}, nil, 1420, nil)
 	if err != nil {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { dev.Close() })
-	CreateForwarder(s, func(c xnet.Conn, _ xnet.Destination) { c.Close() })
-	CreateICMPEchoResponder(s)
-	return dev.(*netTun)
+	// Stack connections do not implement deadlines; closing the device unblocks Read.
+	timer := time.AfterFunc(30*time.Second, func() { dev.Close() })
+	tb.Cleanup(func() { timer.Stop() })
+	return dev
 }
 
 func throughputEchoPacket() []byte {
 	packet := make([]byte, throughputPacketSize)
-	ip := header.IPv4(packet)
-	ip.Encode(&header.IPv4Fields{
-		TotalLength: uint16(len(packet)), TTL: 64, Protocol: uint8(header.ICMPv4ProtocolNumber),
-		SrcAddr: tcpip.AddrFrom4([4]byte{10, 66, 0, 2}), DstAddr: tcpip.AddrFrom4([4]byte{1, 1, 1, 1}),
-	})
-	ip.SetChecksum(^ip.CalculateChecksum())
-	echo := header.ICMPv4(packet[header.IPv4MinimumSize:])
-	echo.SetType(header.ICMPv4Echo)
-	echo.SetIdent(123)
-	echo.SetChecksum(header.ICMPv4Checksum(echo[:header.ICMPv4MinimumSize], checksum.Checksum(echo.Payload(), 0)))
+	packet[0], packet[8], packet[9] = 0x45, 64, 1
+	binary.BigEndian.PutUint16(packet[2:], uint16(len(packet)))
+	copy(packet[12:16], []byte{10, 66, 0, 2})
+	copy(packet[16:20], []byte{10, 66, 0, 1})
+	binary.BigEndian.PutUint16(packet[10:], ^onesSum(packet[:20], 0))
+	echo := packet[20:]
+	echo[0] = 8
+	binary.BigEndian.PutUint16(echo[4:], 123)
+	binary.BigEndian.PutUint16(echo[2:], ^onesSum(echo, 0))
 	return packet
 }
 
@@ -69,38 +72,35 @@ func BenchmarkNetTUNWriteRead(b *testing.B) {
 			dev := newThroughputTUN(b)
 			writes, _, _ := benchmarkBuffers(batch, throughputPacketSize)
 			packet := throughputEchoPacket()
-			ip := header.IPv4(packet)
-			ip.SetDestinationAddress(tcpip.AddrFrom4([4]byte{10, 66, 0, 1}))
-			ip.SetChecksum(0)
-			ip.SetChecksum(^ip.CalculateChecksum())
-			for i := range writes {
-				copy(writes[i], packet)
-			}
 			reads, sizes, _ := benchmarkBuffers(dev.BatchSize(), 2048)
-			done := make(chan error, 1)
-			go func() {
-				for range b.N {
-					remaining := batch
-					for remaining > 0 {
-						n, err := dev.Read(reads, sizes, 0)
-						if err != nil {
-							done <- err
-							return
-						}
-						remaining -= n
-					}
-					done <- nil
-				}
-			}()
+			if _, err := dev.Write([][]byte{bytes.Clone(packet)}, 0); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := dev.Read(reads, sizes, 0); err != nil {
+				b.Fatal(err)
+			}
+			reply := reads[0][:sizes[0]]
+			if len(reply) != len(packet) || reply[20] != 0 || !bytes.Equal(reply[24:], packet[24:]) {
+				b.Fatal("NetTUN echo payload mismatch")
+			}
 			b.SetBytes(int64(batch * throughputPacketSize))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
+				// Input may modify an ICMP request into its reply. Restore every
+				// request rather than timing a dropped echo reply after iteration one.
+				for i := range writes {
+					copy(writes[i], packet)
+				}
 				if _, err := dev.Write(writes, 0); err != nil {
 					b.Fatal(err)
 				}
-				if err := <-done; err != nil {
-					b.Fatal(err)
+				for remaining := batch; remaining > 0; {
+					n, err := dev.Read(reads, sizes, 0)
+					if err != nil {
+						b.Fatal(err)
+					}
+					remaining -= n
 				}
 			}
 			b.StopTimer()
@@ -115,14 +115,16 @@ func newThroughputBind(tb testing.TB, network, address string) (*bind, conn.Rece
 	if err != nil {
 		tb.Fatal(err)
 	}
-	udp.SetDeadline(time.Now().Add(30 * time.Second))
-	b := &bind{batchEnabled: true, listenFunc: func() (net.PacketConn, error) { return udp, nil }}
+	b := &bind{ctx: context.Background(), batchEnabled: true, listenFunc: func(context.Context) (net.PacketConn, error) { return udp, nil }}
 	fns, _, err := b.Open(0)
 	if err != nil {
 		udp.Close()
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { b.Close() })
+	// bind retries receive errors; close it instead of setting a socket deadline.
+	timer := time.AfterFunc(30*time.Second, func() { b.Close() })
+	tb.Cleanup(func() { timer.Stop() })
 	return b, fns[0], udp
 }
 
@@ -176,7 +178,7 @@ func newBenchmarkWireGuardDevices(tb testing.TB, tuns [2]tun.Device) {
 	var ports [2]int
 	var private, public [2][32]byte
 	for i, tdev := range tuns {
-		binding := &bind{batchEnabled: true, listenFunc: func() (net.PacketConn, error) {
+		binding := &bind{ctx: context.Background(), batchEnabled: true, listenFunc: func(context.Context) (net.PacketConn, error) {
 			return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		}}
 		devs[i] = device.NewDevice(tdev, binding, device.NewLogger(device.LogLevelError, ""))
@@ -215,66 +217,49 @@ func newBenchmarkWireGuardDevices(tb testing.TB, tuns [2]tun.Device) {
 	}
 }
 
-func acceptBenchmarkTCP(tb testing.TB, listener net.Listener, dial func(context.Context) (net.Conn, error)) (net.Conn, net.Conn) {
-	tb.Helper()
-	tb.Cleanup(func() { listener.Close() })
-	type acceptResult struct {
-		conn net.Conn
-		err  error
-	}
-	accepted := make(chan acceptResult, 1)
-	go func() {
-		c, err := listener.Accept()
-		accepted <- acceptResult{c, err}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	client, err := dial(ctx)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	tb.Cleanup(func() { client.Close() })
-	var server net.Conn
-	select {
-	case result := <-accepted:
-		if result.err != nil {
-			tb.Fatal(result.err)
-		}
-		server = result.conn
-	case <-ctx.Done():
-		tb.Fatal(ctx.Err())
-	}
-	tb.Cleanup(func() { server.Close() })
-	client.SetDeadline(time.Now().Add(30 * time.Second))
-	server.SetDeadline(time.Now().Add(30 * time.Second))
-	return client, server
+type benchmarkTCPHandler struct {
+	accepted chan net.Conn
+}
+
+func (h benchmarkTCPHandler) HandleConnection(c xnet.Conn, _ xnet.Destination) {
+	h.accepted <- c
 }
 
 func newWireGuardTCPPair(tb testing.TB) (net.Conn, net.Conn) {
 	tb.Helper()
-	var tuns [2]tun.Device
-	var xrayTuns [2]*netTun
-	for i := range tuns {
-		addresses := []netip.Addr{netip.AddrFrom4([4]byte{10, 77, 0, byte(i + 1)})}
-		tunDev, _, _, err := CreateNetTUN(addresses, nil, 1420, true)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		tuns[i] = tunDev
-		xrayTuns[i] = tunDev.(*netTun)
-	}
-	newBenchmarkWireGuardDevices(tb, tuns)
-	address := netip.MustParseAddrPort("10.77.0.2:12345")
-	listener, err := gonet.ListenTCP(xrayTuns[1].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4([4]byte{10, 77, 0, 2}), Port: 12345}, header.IPv4ProtocolNumber)
+	accepted := make(chan net.Conn, 1)
+	serverTUN, _, err := CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.77.0.2")}, nil, 1420, benchmarkTCPHandler{accepted})
 	if err != nil {
 		tb.Fatal(err)
 	}
-	return acceptBenchmarkTCP(tb, listener, func(ctx context.Context) (net.Conn, error) {
-		return xrayTuns[0].DialContextTCPAddrPort(ctx, address)
-	})
+	tb.Cleanup(func() { serverTUN.Close() })
+	clientTUN, network, err := CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.77.0.1")}, nil, 1420, nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { clientTUN.Close() })
+	newBenchmarkWireGuardDevices(tb, [2]tun.Device{clientTUN, serverTUN})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := network.DialContextTCPAddrPort(ctx, netip.MustParseAddrPort("10.77.0.2:12345"))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { client.Close() })
+	select {
+	case server := <-accepted:
+		tb.Cleanup(func() { server.Close() })
+		return client, server
+	case <-ctx.Done():
+		tb.Fatal(ctx.Err())
+		return nil, nil
+	}
 }
 
 func benchmarkTCPStream(b *testing.B, client, server net.Conn) {
+	// proxy/tun streams end on Close rather than SetDeadline.
+	timer := time.AfterFunc(30*time.Second, func() { client.Close(); server.Close() })
+	defer timer.Stop()
 	payload := bytes.Repeat([]byte("WireGuard TCP payload\x00\xff"), (64<<10)/23+1)[:64<<10]
 	// Verify one full payload before timing; the hot loop measures transport only.
 	verified := make(chan error, 1)
@@ -322,42 +307,3 @@ func BenchmarkWireGuardTCP(b *testing.B) {
 	benchmarkTCPStream(b, client, server)
 }
 
-func BenchmarkUDPManagerSteadyState(b *testing.B) {
-	m := &udpManager{handler: func(xnet.Conn, xnet.Destination) {}}
-	m.m = make(map[udpFlowKey]*udpConn)
-	src := xnet.UDPDestination(xnet.ParseAddress("10.66.0.2"), 1234)
-	dst := xnet.UDPDestination(xnet.ParseAddress("1.1.1.1"), 53)
-	payload := make([]byte, throughputPacketSize)
-	m.feed(src, dst, payload)
-	var uc *udpConn
-	for _, flow := range m.m {
-		uc = flow
-	}
-	uc.queue.pop()
-	b.SetBytes(int64(len(payload)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		m.feed(src, dst, payload)
-		uc.queue.pop()
-	}
-}
-
-func BenchmarkWriteRawUDPPacket(b *testing.B) {
-	dev := newThroughputTUN(b)
-	// Drain the endpoint directly to avoid the blocking notification callback.
-	dev.ep.RemoveNotify(dev.notifyHandle)
-	m := &udpManager{stack: dev.stack}
-	src := xnet.UDPDestination(xnet.ParseAddress("1.1.1.1"), 53)
-	dst := xnet.UDPDestination(xnet.ParseAddress("10.66.0.2"), 1234)
-	payload := make([]byte, throughputPacketSize)
-	b.SetBytes(int64(len(payload)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		if err := m.writeRawUDPPacket(payload, src, dst); err != nil {
-			b.Fatal(err)
-		}
-		dev.ep.Drain()
-	}
-}
