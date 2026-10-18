@@ -283,7 +283,8 @@ func (s *Server) Start() error {
 		return pktConn, nil
 	}
 	bind := &bind{
-		listenFunc: listenFunc,
+		listenFunc:   listenFunc,
+		batchEnabled: s.streamSettings.FinalMask == nil,
 	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {

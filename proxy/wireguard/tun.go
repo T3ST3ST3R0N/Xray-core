@@ -81,14 +81,11 @@ func CreateForwarder(gstack *stack.Stack, handler func(conn net.Conn, dest net.D
 	manager := &udpManager{
 		stack:   gstack,
 		handler: handler,
-		m:       make(map[string]*udpConn),
+		m:       make(map[udpFlowKey]*udpConn),
 	}
 
 	gstack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 		data := pkt.Data().AsRange().ToSlice()
-		// if len(data) == 0 {
-		// 	return false
-		// }
 		srcIP := net.IPAddress(id.RemoteAddress.AsSlice())
 		dstIP := net.IPAddress(id.LocalAddress.AsSlice())
 		if srcIP == nil || dstIP == nil {
@@ -101,16 +98,28 @@ func CreateForwarder(gstack *stack.Stack, handler func(conn net.Conn, dest net.D
 	})
 }
 
+type udpFlowKey struct {
+	// IPAddress stores IPv4/IPv6 as comparable arrays. Retain those values
+	// rather than formatting the same source address for every datagram.
+	address net.Address
+	port    net.Port
+}
+
+func flowKey(src net.Destination) udpFlowKey {
+	return udpFlowKey{address: src.Address, port: src.Port}
+}
+
 type udpManager struct {
 	stack   *stack.Stack
 	handler func(conn net.Conn, dest net.Destination)
-	m       map[string]*udpConn
+	m       map[udpFlowKey]*udpConn
 	mutex   sync.RWMutex
 }
 
 func (m *udpManager) feed(src net.Destination, dst net.Destination, data []byte) {
+	key := flowKey(src)
 	m.mutex.RLock()
-	uc, ok := m.m[src.NetAddr()]
+	uc, ok := m.m[key]
 	if ok {
 		if !uc.queue.push(&packet{p: data, dest: &dst}) {
 			errors.LogDebug(context.Background(), "drop udp with size ", len(data), " to ", dst.NetAddr(), " original ", uc.dst.NetAddr(), " > queue full")
@@ -123,7 +132,7 @@ func (m *udpManager) feed(src net.Destination, dst net.Destination, data []byte)
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	uc, ok = m.m[src.NetAddr()]
+	uc, ok = m.m[key]
 	if !ok {
 		uc = &udpConn{
 			queue: newPacketQueue(udpQueueLimit),
@@ -136,7 +145,7 @@ func (m *udpManager) feed(src net.Destination, dst net.Destination, data []byte)
 			m.close(uc)
 			m.mutex.Unlock()
 		}
-		m.m[src.NetAddr()] = uc
+		m.m[key] = uc
 		go m.handler(uc, dst)
 	}
 
@@ -149,7 +158,7 @@ func (m *udpManager) close(uc *udpConn) {
 	if !uc.closed {
 		uc.closed = true
 		uc.queue.close()
-		delete(m.m, uc.src.NetAddr())
+		delete(m.m, flowKey(uc.src))
 	}
 }
 
@@ -167,14 +176,12 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 		ipProtocol = header.IPv4ProtocolNumber
 	}
 
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: ipHdrSize + header.UDPMinimumSize,
-		Payload:            buffer.MakeWithData(payload),
-	})
-	defer pkt.DecRef()
+	view := buffer.NewViewSize(ipHdrSize + udpLen)
+	packet := view.AsSlice()
+	copy(packet[ipHdrSize+header.UDPMinimumSize:], payload)
 
 	// Build UDP header
-	udpHdr := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
+	udpHdr := header.UDP(packet[ipHdrSize : ipHdrSize+header.UDPMinimumSize])
 	udpHdr.Encode(&header.UDPFields{
 		SrcPort: uint16(src.Port),
 		DstPort: uint16(dst.Port),
@@ -187,7 +194,7 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 
 	// Build IP header
 	if isIPv4 {
-		ipHdr := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
+		ipHdr := header.IPv4(packet[:ipHdrSize])
 		ipHdr.Encode(&header.IPv4Fields{
 			TotalLength: uint16(header.IPv4MinimumSize + udpLen),
 			TTL:         64,
@@ -197,7 +204,7 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 		})
 		ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
 	} else {
-		ipHdr := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
+		ipHdr := header.IPv6(packet[:ipHdrSize])
 		ipHdr.Encode(&header.IPv6Fields{
 			PayloadLength:     uint16(udpLen),
 			TransportProtocol: header.UDPProtocolNumber,
@@ -208,7 +215,7 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 	}
 
 	// dispatch the packet
-	err := m.stack.WriteRawPacket(1, ipProtocol, buffer.MakeWithView(pkt.ToView()))
+	err := m.stack.WriteRawPacket(1, ipProtocol, buffer.MakeWithView(view))
 	if err != nil {
 		return errors.New("failed to write raw udp packet back to stack err ", err)
 	}
@@ -231,22 +238,27 @@ type udpConn struct {
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	var packets [64]*packet
 	for {
-		q, ok := c.queue.pop()
-		if !ok {
+		n := c.queue.popBatch(packets[:])
+		if n == 0 {
 			return nil, io.EOF
 		}
-
-		b := buf.New()
-		if _, err := b.Write(q.p); err != nil {
-			errors.LogErrorInner(context.Background(), err, "drop packet to ", q.dest, " with size ", len(q.p))
-			b.Release()
-			continue
+		mb := make(buf.MultiBuffer, 0, n)
+		for i, p := range packets[:n] {
+			packets[i] = nil
+			b := buf.New()
+			if _, err := b.Write(p.p); err != nil {
+				errors.LogErrorInner(context.Background(), err, "drop packet to ", p.dest, " with size ", len(p.p))
+				b.Release()
+				continue
+			}
+			b.UDP = p.dest
+			mb = append(mb, b)
 		}
-
-		b.UDP = q.dest
-
-		return buf.MultiBuffer{b}, nil
+		if len(mb) > 0 {
+			return mb, nil
+		}
 	}
 }
 
@@ -350,21 +362,32 @@ func (q *packetQueue) push(p *packet) bool {
 
 // pop blocks until a packet is queued or the queue is closed and drained.
 func (q *packetQueue) pop() (*packet, bool) {
+	var packets [1]*packet
+	n := q.popBatch(packets[:])
+	return packets[0], n != 0
+}
+
+// popBatch blocks for the first packet, then drains at most len(dst) queued
+// packets. The existing per-flow queue bound and drop policy stay unchanged.
+func (q *packetQueue) popBatch(dst []*packet) int {
+	if len(dst) == 0 {
+		return 0
+	}
 	for {
 		q.mu.Lock()
 		if len(q.items) > 0 {
-			p := q.items[0]
-			q.items[0] = nil
-			q.items = q.items[1:]
+			n := copy(dst, q.items)
+			clear(q.items[:n])
+			q.items = q.items[n:]
 			if len(q.items) == 0 {
 				q.items = nil
 			}
 			q.mu.Unlock()
-			return p, true
+			return n
 		}
 		if q.closed {
 			q.mu.Unlock()
-			return nil, false
+			return 0
 		}
 		q.mu.Unlock()
 		<-q.notify

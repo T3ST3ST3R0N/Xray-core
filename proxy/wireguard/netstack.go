@@ -138,8 +138,15 @@ func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 	n := 0
 	for pkt := tun.ep.ReadContext(context.Background()); pkt != nil; pkt = tun.ep.Read() {
 		size := 0
-		for _, s := range pkt.AsSlices() {
-			size += copy(buf[n][offset+size:], s)
+		views, skip := pkt.AsViewList()
+		for v := views.Front(); v != nil; v = v.Next() {
+			s := v.AsSlice()
+			if skip >= len(s) {
+				skip -= len(s)
+				continue
+			}
+			size += copy(buf[n][offset+size:], s[skip:])
+			skip = 0
 		}
 		pkt.DecRef()
 		sizes[n] = size
@@ -171,8 +178,10 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 		case 6:
 			tun.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
 		default:
+			pkb.DecRef()
 			return 0, syscall.EAFNOSUPPORT
 		}
+		pkb.DecRef()
 	}
 	return len(buf), nil
 }

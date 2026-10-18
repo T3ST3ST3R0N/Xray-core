@@ -299,9 +299,10 @@ func (h *Handler) init(ctx context.Context) error {
 	// device.NewDevice may use the bind right away (Up -> BindUpdate -> Open),
 	// so everything it reads must be set before creating the device.
 	bind := &bind{
-		resolveFunc: resolveFunc,
-		listenFunc:  listenFunc,
-		reserved:    h.conf.Reserved,
+		resolveFunc:  resolveFunc,
+		listenFunc:   listenFunc,
+		reserved:     h.conf.Reserved,
+		batchEnabled: h.streamSettings.FinalMask == nil && h.streamSettings.SocketSettings.GetDialerProxy() == "",
 	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {
@@ -404,35 +405,64 @@ type UDPConnClient struct {
 func (c *UDPConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
-	n, addr, err := c.PacketConn.ReadFrom(b.Bytes())
+	var n int
+	var source net.Destination
+	var err error
+	if udp, ok := c.PacketConn.(*net.UDPConn); ok {
+		var addr netip.AddrPort
+		n, addr, err = udp.ReadFromUDPAddrPort(b.Bytes())
+		if err == nil {
+			source = net.UDPDestination(net.IPAddress(addr.Addr().AsSlice()), net.Port(addr.Port()))
+		}
+	} else {
+		var addr net.Addr
+		n, addr, err = c.PacketConn.ReadFrom(b.Bytes())
+		if err == nil {
+			udpAddr := addr.(*net.UDPAddr)
+			source = net.UDPDestination(net.IPAddress(udpAddr.IP), net.Port(udpAddr.Port))
+		}
+	}
 	if err != nil {
 		b.Release()
 		return nil, err
 	}
 	b.Resize(0, int32(n))
-
-	b.UDP = &net.Destination{
-		Address: net.IPAddress(addr.(*net.UDPAddr).IP),
-		Port:    net.Port(addr.(*net.UDPAddr).Port),
-		Network: net.Network_UDP,
-	}
+	b.UDP = &source
 
 	return buf.MultiBuffer{b}, nil
 }
 
 func (c *UDPConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	udp, native := c.PacketConn.(*net.UDPConn)
+	defaultAddr := c.Dest.AddrPort()
+	defaultIP := net.IPAddress(c.Dest.IP)
 	for i, b := range mb {
 		dst := c.Dest
+		dstAddr := defaultAddr
 		if b.UDP != nil {
 			if b.UDP.Address.Family().IsDomain() {
 				if b.UDP.Port != net.Port(dst.Port) {
-					dst = &net.UDPAddr{IP: dst.IP, Port: int(b.UDP.Port)}
+					if native {
+						dstAddr = netip.AddrPortFrom(defaultAddr.Addr(), uint16(b.UDP.Port))
+					} else {
+						dst = &net.UDPAddr{IP: dst.IP, Port: int(b.UDP.Port), Zone: dst.Zone}
+					}
 				}
-			} else {
-				dst = b.UDP.RawNetAddr().(*net.UDPAddr)
+			} else if b.UDP.Address != defaultIP || b.UDP.Port != net.Port(dst.Port) {
+				if native {
+					addr, _ := netip.AddrFromSlice(b.UDP.Address.IP())
+					dstAddr = netip.AddrPortFrom(addr, uint16(b.UDP.Port))
+				} else {
+					dst = b.UDP.RawNetAddr().(*net.UDPAddr)
+				}
 			}
 		}
-		_, err := c.PacketConn.WriteTo(b.Bytes(), dst)
+		var err error
+		if native {
+			_, err = udp.WriteToUDPAddrPort(b.Bytes(), dstAddr)
+		} else {
+			_, err = c.PacketConn.WriteTo(b.Bytes(), dst)
+		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err

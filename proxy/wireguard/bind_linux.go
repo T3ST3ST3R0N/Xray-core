@@ -6,9 +6,10 @@ import (
 	"encoding/binary"
 	goerrors "errors"
 	"net"
+	"os"
+	"syscall"
 	"unsafe"
 
-	"github.com/xtls/xray-core/features/stats"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
@@ -19,38 +20,25 @@ const batchSize = conn.IdealBatchSize
 
 var gsoControlSize = unix.CmsgSpace(2)
 
-// newBatchConn returns a batchConn for c, or nil when c is not a plain UDP
-// socket. gso reports UDP_SEGMENT support.
-func newBatchConn(c net.PacketConn) (bc batchConn, gso bool, rc, wc stats.Counter) {
-	if pc, ok := c.(*PacketCounterConnection); ok {
-		c, rc, wc = pc.PacketConn, pc.ReadCounter, pc.WriteCounter
-	}
-	udp, ok := c.(*net.UDPConn)
-	if !ok {
-		return nil, false, nil, nil
+// newBatchConn batches only native UDP sockets on Linux. Callers must opt in
+// before creating the WireGuard device, whose pool sizes cannot grow later.
+func newBatchConn(udp *net.UDPConn) (batchConn, bool) {
+	if udp == nil {
+		return nil, false
 	}
 	setSocketBuffers(udp)
-	gso = supportsGSO(udp)
+	gso := supportsGSO(udp)
 	if la, ok := udp.LocalAddr().(*net.UDPAddr); ok && la.IP.To4() != nil {
-		return ipv4.NewPacketConn(udp), gso, rc, wc
+		return ipv4.NewPacketConn(udp), gso
 	}
-	return ipv6.NewPacketConn(udp), gso, rc, wc
+	return ipv6.NewPacketConn(udp), gso
 }
 
-// setSocketBuffers raises the UDP socket buffers like wireguard-go does. The
-// FORCE variants pass net.core.rmem_max/wmem_max but need CAP_NET_ADMIN, so
-// they fail quietly without it.
+// setSocketBuffers preserves the native bind's existing 7 MiB target, subject
+// to the system limits. Never require CAP_NET_ADMIN to bypass those limits.
 func setSocketBuffers(c *net.UDPConn) {
 	_ = c.SetReadBuffer(socketBufferSize)
 	_ = c.SetWriteBuffer(socketBufferSize)
-	rc, err := c.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = rc.Control(func(fd uintptr) {
-		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, socketBufferSize)
-		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, socketBufferSize)
-	})
 }
 
 // supportsGSO reports whether the kernel takes UDP_SEGMENT on c (Linux 4.18+).
@@ -65,6 +53,80 @@ func supportsGSO(c *net.UDPConn) bool {
 		gso = err == nil
 	})
 	return gso
+}
+
+// Keep the GSO sendmsg iovecs in the pooled metadata; SendmsgBuffers would
+// allocate an iovec slice for runs longer than two datagrams.
+type bindSendmsg struct {
+	iov   [maxGSOSegments]unix.Iovec
+	hdr   unix.Msghdr
+	addr4 unix.RawSockaddrInet4
+	addr6 unix.RawSockaddrInet6
+	write func(uintptr) bool
+	err   error
+}
+
+func (m *bindSendmsg) send(fd uintptr) bool {
+	for {
+		_, _, errno := unix.Syscall(unix.SYS_SENDMSG, fd, uintptr(unsafe.Pointer(&m.hdr)), 0)
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno == unix.EAGAIN || errno == unix.EWOULDBLOCK {
+			return false // RawConn.Write waits for writability and honors deadlines.
+		}
+		if errno != 0 {
+			m.err = os.NewSyscallError("sendmsg", errno)
+		}
+		return true
+	}
+}
+
+func writeBatch(bc batchConn, raw syscall.RawConn, send *bindSendmsg, msgs []ipv6.Message) (int, error) {
+	if len(msgs) != 1 || len(msgs[0].OOB) == 0 || raw == nil {
+		return bc.WriteBatch(msgs, 0)
+	}
+	message := &msgs[0]
+	addr := message.Addr.(*net.UDPAddr)
+	if addr.Zone != "" {
+		return bc.WriteBatch(msgs, 0)
+	}
+	send.err = nil
+	send.hdr = unix.Msghdr{}
+	if ip := addr.IP.To4(); ip != nil {
+		send.addr4 = unix.RawSockaddrInet4{Family: unix.AF_INET}
+		binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&send.addr4.Port))[:], uint16(addr.Port))
+		copy(send.addr4.Addr[:], ip)
+		send.hdr.Name = (*byte)(unsafe.Pointer(&send.addr4))
+		send.hdr.Namelen = unix.SizeofSockaddrInet4
+	} else {
+		send.addr6 = unix.RawSockaddrInet6{Family: unix.AF_INET6}
+		binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&send.addr6.Port))[:], uint16(addr.Port))
+		copy(send.addr6.Addr[:], addr.IP)
+		send.hdr.Name = (*byte)(unsafe.Pointer(&send.addr6))
+		send.hdr.Namelen = unix.SizeofSockaddrInet6
+	}
+	for i, buf := range message.Buffers {
+		send.iov[i].Base = &buf[0] // GSO groups contain only nonempty datagrams.
+		send.iov[i].SetLen(len(buf))
+	}
+	send.hdr.Iov = &send.iov[0]
+	send.hdr.SetIovlen(len(message.Buffers))
+	send.hdr.Control = &message.OOB[0]
+	send.hdr.SetControllen(len(message.OOB))
+	if send.write == nil {
+		send.write = send.send
+	}
+	err := raw.Write(send.write)
+	clear(send.iov[:len(message.Buffers)])
+	send.hdr = unix.Msghdr{}
+	if err != nil {
+		return 0, err
+	}
+	if send.err != nil {
+		return 0, send.err
+	}
+	return 1, nil
 }
 
 // setGSOSize returns oob[:0] holding a UDP_SEGMENT control message.
@@ -86,5 +148,7 @@ func setGSOSize(oob []byte, size int) []byte {
 // kernels) when a segment is larger than the path MTU, where a plain send
 // would be fragmented.
 func gsoFailed(err error) bool {
-	return goerrors.Is(err, unix.EIO) || goerrors.Is(err, unix.EMSGSIZE) || goerrors.Is(err, unix.EINVAL)
+	return goerrors.Is(err, unix.EIO) || goerrors.Is(err, unix.EMSGSIZE) ||
+		goerrors.Is(err, unix.EINVAL) || goerrors.Is(err, unix.ENOPROTOOPT) ||
+		goerrors.Is(err, unix.EOPNOTSUPP)
 }

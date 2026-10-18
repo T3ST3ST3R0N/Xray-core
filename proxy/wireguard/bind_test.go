@@ -26,7 +26,8 @@ func openTestBind(t *testing.T, network, addr string, reserved []byte) (*bind, c
 	t.Helper()
 	rc, wc := &testCounter{}, &testCounter{}
 	b := &bind{
-		reserved: reserved,
+		reserved:     reserved,
+		batchEnabled: true,
 		listenFunc: func() (net.PacketConn, error) {
 			c, err := net.ListenPacket(network, addr)
 			if err != nil {
@@ -104,7 +105,7 @@ func testBindRoundTrip(t *testing.T, network, bindAddr, peerAddr string, wantBat
 			t.Fatal(err)
 		}
 	}
-	rbufs := make([][]byte, conn.IdealBatchSize)
+	rbufs := make([][]byte, b.BatchSize())
 	for i := range rbufs {
 		rbufs[i] = make([]byte, 2048)
 	}
@@ -260,6 +261,7 @@ func testBindGSO(t *testing.T, network, bindAddr, peerAddr string, failErr error
 	}
 	gc := &gsoConn{batchConn: b.batch, failErr: failErr}
 	b.batch = gc
+	b.raw = nil // Exercise the injected batch connection, not native sendmsg.
 	pa, err := net.ResolveUDPAddr("udp", peerAddr)
 	if err != nil {
 		t.Fatal(err)
@@ -334,6 +336,102 @@ func TestBindGSOFallback(t *testing.T) {
 	for _, err := range []error{syscall.EIO, syscall.EMSGSIZE, syscall.EINVAL} {
 		t.Run(err.Error(), func(t *testing.T) {
 			testBindGSO(t, "udp4", "127.0.0.1:0", "127.0.0.1:0", err)
+		})
+	}
+}
+
+type wrappedTestPacketConn struct {
+	net.PacketConn
+	reads  atomic.Int64
+	writes atomic.Int64
+}
+
+func (c *wrappedTestPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.reads.Add(1)
+	return c.PacketConn.ReadFrom(p)
+}
+
+func (c *wrappedTestPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.writes.Add(1)
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+func TestBindFallbackDeliveryAndBatchBound(t *testing.T) {
+	for _, optIn := range []bool{false, true} {
+		name := "custom default"
+		if optIn {
+			name = "native opt-in downgraded"
+		}
+		t.Run(name, func(t *testing.T) {
+			rc, wc := &testCounter{}, &testCounter{}
+			var wrapped *wrappedTestPacketConn
+			opens := 0
+			b := &bind{
+				batchEnabled: optIn,
+				reserved:     []byte{1, 2, 3},
+				listenFunc: func() (net.PacketConn, error) {
+					c, err := net.ListenPacket("udp4", "127.0.0.1:0")
+					if err != nil {
+						return nil, err
+					}
+					opens++
+					if opens == 1 {
+						wrapped = &wrappedTestPacketConn{PacketConn: c}
+						c = wrapped
+					}
+					return &PacketCounterConnection{PacketConn: c, ReadCounter: rc, WriteCounter: wc}, nil
+				},
+			}
+			t.Cleanup(func() { b.Close() })
+			beforeOpen := b.BatchSize()
+			wantBefore := 1
+			if optIn {
+				wantBefore = batchSize
+			}
+			if beforeOpen != wantBefore {
+				t.Fatalf("pre-open BatchSize = %d, want %d", beforeOpen, wantBefore)
+			}
+			peer := newUDPClientTestSocket(t, "udp4", "127.0.0.1:0")
+			ep := &conn.StdNetEndpoint{AddrPort: peer.LocalAddr().(*net.UDPAddr).AddrPort()}
+			for round := range 2 {
+				fns, _, err := b.Open(0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if b.BatchSize() != 1 || b.BatchSize() > beforeOpen || b.batch != nil {
+					t.Fatalf("fallback grew its advertised batch bound: %d", b.BatchSize())
+				}
+				sent := []byte{4, 0, 0, 0, byte(round)}
+				if err := b.Send([][]byte{sent}, ep); err != nil {
+					t.Fatal(err)
+				}
+				var packet [32]byte
+				n, _, err := peer.ReadFromUDP(packet[:])
+				if err != nil || !bytes.Equal(packet[:n], []byte{4, 1, 2, 3, byte(round)}) {
+					t.Fatalf("fallback send: n=%d err=%v data=%v", n, err, packet[:n])
+				}
+				if _, err := peer.WriteToUDP(packet[:n], b.LocalAddr().(*net.UDPAddr)); err != nil {
+					t.Fatal(err)
+				}
+				reads := [][]byte{make([]byte, 32)}
+				sizes, eps := make([]int, 1), make([]conn.Endpoint, 1)
+				n, err = fns[0](reads, sizes, eps)
+				if err != nil || n != 1 || !bytes.Equal(reads[0][:sizes[0]], []byte{4, 0, 0, 0, byte(round)}) {
+					t.Fatalf("fallback receive: n=%d err=%v", n, err)
+				}
+				if eps[0].(*conn.StdNetEndpoint).AddrPort != ep.AddrPort {
+					t.Fatal("fallback lost the source endpoint")
+				}
+				if rc.Value() != int64((round+1)*5) || wc.Value() != int64((round+1)*5) {
+					t.Fatalf("fallback counters: read=%d write=%d", rc.Value(), wc.Value())
+				}
+				b.Close()
+			}
+			// The first socket must use the wrapper, and reopening on a plain
+			// socket must not grow the lifetime bound allocated before Open.
+			if wrapped.reads.Load() != 1 || wrapped.writes.Load() != 1 || b.BatchSize() != 1 {
+				t.Fatal("fallback bypassed the wrapper or enlarged its batch on reopen")
+			}
 		})
 	}
 }

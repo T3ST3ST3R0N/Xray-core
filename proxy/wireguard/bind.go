@@ -41,16 +41,44 @@ type bind struct {
 	downFunc    func() error
 	reserved    []byte
 
+	// batchEnabled opts a known native listener into Linux batching before
+	// NewDevice allocates its lifetime-sized pools. Custom/masked listeners
+	// default to one packet; Open may disable batching, but never enable it.
+	batchEnabled bool
+
 	net.PacketConn
 	// batch is set when the conn is a plain UDP socket on Linux. The traffic
 	// counters are then applied here, since PacketCounterConnection is bypassed.
 	batch        batchConn
 	gso          bool // batch takes UDP_SEGMENT
+	udp          *net.UDPConn
+	raw          syscall.RawConn
 	readCounter  stats.Counter
 	writeCounter stats.Counter
 	msgsPool     sync.Pool
 	closeCh      chan struct{}
 	mu           sync.Mutex
+}
+
+type bindMessages struct {
+	messages [conn.IdealBatchSize]ipv6.Message
+	control  [conn.IdealBatchSize][24]byte // Largest Linux CmsgSpace(sizeof(uint16)).
+	used     int                           // High-water mark across send chunks.
+	addr     net.UDPAddr
+	ip       [16]byte
+	send     bindSendmsg
+}
+
+// nativeUDPConn unwraps only the transparent traffic counter, never a mask.
+func nativeUDPConn(c net.PacketConn) (*net.UDPConn, stats.Counter, stats.Counter) {
+	var rc, wc stats.Counter
+	if pc, ok := c.(*PacketCounterConnection); ok {
+		c, rc, wc = pc.PacketConn, pc.ReadCounter, pc.WriteCounter
+	}
+	if udp, ok := c.(*net.UDPConn); ok {
+		return udp, rc, wc
+	}
+	return nil, nil, nil
 }
 
 func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
@@ -66,13 +94,22 @@ func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err
 		return nil, 0, err
 	}
 	b.PacketConn = c
-	b.batch, b.gso, b.readCounter, b.writeCounter = newBatchConn(c)
+	b.udp, b.readCounter, b.writeCounter = nativeUDPConn(c)
+	if b.batchEnabled {
+		b.batch, b.gso = newBatchConn(b.udp)
+		if b.batch == nil {
+			b.batchEnabled = false
+		}
+	}
+	if b.batch != nil {
+		b.raw, _ = b.udp.SyscallConn()
+	}
 	ch := make(chan struct{})
 	b.closeCh = ch
 
-	recv := b.makeReceive(c, ch)
+	recv := b.makeReceive(c, b.udp, b.readCounter, ch)
 	if b.batch != nil {
-		recv = b.makeReceiveBatch(b.batch, ch)
+		recv = b.makeReceiveBatch(b.batch, b.readCounter, ch)
 	}
 	return []conn.ReceiveFunc{recv}, uint16(c.LocalAddr().(*net.UDPAddr).Port), nil
 }
@@ -99,10 +136,19 @@ func (b *bind) readFailed(err error, ch chan struct{}) bool {
 	return false
 }
 
-func (b *bind) makeReceive(c net.PacketConn, ch chan struct{}) conn.ReceiveFunc {
+func (b *bind) makeReceive(c net.PacketConn, udp *net.UDPConn, rc stats.Counter, ch chan struct{}) conn.ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []conn.Endpoint) (n int, err error) {
 		for {
-			n, addr, err := c.ReadFrom(bufs[0])
+			var addr netip.AddrPort
+			if udp != nil {
+				n, addr, err = udp.ReadFromUDPAddrPort(bufs[0])
+			} else {
+				var rawAddr net.Addr
+				n, rawAddr, err = c.ReadFrom(bufs[0])
+				if err == nil {
+					addr = rawAddr.(*net.UDPAddr).AddrPort()
+				}
+			}
 			if err != nil {
 				if b.readFailed(err, ch) {
 					return 0, net.ErrClosed
@@ -115,7 +161,10 @@ func (b *bind) makeReceive(c net.PacketConn, ch chan struct{}) conn.ReceiveFunc 
 				bufs[0][3] = 0
 			}
 			sizes[0] = n
-			eps[0] = &conn.StdNetEndpoint{AddrPort: addr.(*net.UDPAddr).AddrPort()}
+			eps[0] = &conn.StdNetEndpoint{AddrPort: addr}
+			if rc != nil {
+				rc.Add(int64(n))
+			}
 			return 1, nil
 		}
 	}
@@ -123,7 +172,7 @@ func (b *bind) makeReceive(c net.PacketConn, ch chan struct{}) conn.ReceiveFunc 
 
 // makeReceiveBatch reads up to len(bufs) datagrams per call. wireguard-go calls
 // each ReceiveFunc from a single goroutine, so msgs is not shared.
-func (b *bind) makeReceiveBatch(bc batchConn, ch chan struct{}) conn.ReceiveFunc {
+func (b *bind) makeReceiveBatch(bc batchConn, rc stats.Counter, ch chan struct{}) conn.ReceiveFunc {
 	msgs := make([]ipv6.Message, conn.IdealBatchSize)
 	for i := range msgs {
 		msgs[i].Buffers = make(net.Buffers, 1)
@@ -155,8 +204,8 @@ func (b *bind) makeReceiveBatch(bc batchConn, ch chan struct{}) conn.ReceiveFunc
 				eps[i] = &conn.StdNetEndpoint{AddrPort: m.Addr.(*net.UDPAddr).AddrPort()}
 				total += int64(m.N)
 			}
-			if b.readCounter != nil {
-				b.readCounter.Add(total)
+			if rc != nil {
+				rc.Add(total)
 			}
 			return n, nil
 		}
@@ -178,6 +227,9 @@ func (b *bind) Close() error {
 		_ = b.PacketConn.Close()
 		b.PacketConn = nil
 		b.batch = nil
+		b.udp = nil
+		b.raw = nil
+		b.gso = false
 	}
 	return nil
 }
@@ -188,7 +240,7 @@ func (b *bind) SetMark(mark uint32) error {
 
 func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	b.mu.Lock()
-	c, bc, gso, wc := b.PacketConn, b.batch, b.gso, b.writeCounter
+	c, udp, raw, bc, gso, wc := b.PacketConn, b.udp, b.raw, b.batch, b.gso, b.writeCounter
 	b.mu.Unlock()
 
 	if c == nil {
@@ -204,9 +256,27 @@ func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			}
 		}
 	}
-	addr := net.UDPAddrFromAddrPort(ep.(*conn.StdNetEndpoint).AddrPort)
-
+	addrPort := ep.(*conn.StdNetEndpoint).AddrPort
+	if udp != nil && (bc == nil || len(bufs) == 1) {
+		var total int64
+		for _, buf := range bufs {
+			n, err := udp.WriteToUDPAddrPort(buf, addrPort)
+			if err != nil {
+				if wc != nil {
+					wc.Add(total)
+				}
+				errors.LogErrorInner(context.Background(), err, "bind send err")
+				return err
+			}
+			total += int64(n)
+		}
+		if wc != nil {
+			wc.Add(total)
+		}
+		return nil
+	}
 	if bc == nil {
+		addr := net.UDPAddrFromAddrPort(addrPort)
 		for i := range bufs {
 			if _, err := c.WriteTo(bufs[i], addr); err != nil {
 				errors.LogErrorInner(context.Background(), err, "bind send err")
@@ -218,10 +288,15 @@ func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 	msgs := b.getMsgs()
 	defer b.putMsgs(msgs)
-	sent, err := sendBatch(bc, *msgs, bufs, addr, gso)
-	if err != nil && gso && gsoFailed(err) {
-		// The route does not take UDP_SEGMENT, e.g. no checksum offload or a
-		// path MTU below the datagram size. Send the rest one by one from now on.
+	msgs.ip = addrPort.Addr().As16()
+	msgs.addr = net.UDPAddr{IP: msgs.ip[:], Port: int(addrPort.Port()), Zone: addrPort.Addr().Zone()}
+	if addrPort.Addr().Is4() {
+		msgs.addr.IP = msgs.ip[12:]
+	}
+	sent, failedGSO, err := sendBatch(bc, raw, msgs, bufs, gso)
+	if failedGSO {
+		// Retry only the unsent suffix of a failed UDP_SEGMENT send, using
+		// ordinary batching. A plain-message error must never disable GSO.
 		errors.LogInfoInner(context.Background(), err, "bind: UDP GSO disabled")
 		b.mu.Lock()
 		if b.batch == bc {
@@ -229,7 +304,7 @@ func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		b.mu.Unlock()
 		var more int
-		more, err = sendBatch(bc, *msgs, bufs[sent:], addr, false)
+		more, _, err = sendBatch(bc, raw, msgs, bufs[sent:], false)
 		sent += more
 	}
 	if wc != nil {
@@ -245,25 +320,32 @@ func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	return err
 }
 
-// sendBatch sends bufs to addr and returns how many of them went out before
-// an error.
-func sendBatch(bc batchConn, msgs []ipv6.Message, bufs [][]byte, addr *net.UDPAddr, gso bool) (int, error) {
-	sent := 0
+// sendBatch reports the exact completed datagram prefix, even when WriteBatch
+// returns both progress and an error. failedGSO describes the first unsent
+// message, not merely whether any message in the call used UDP_SEGMENT.
+func sendBatch(bc batchConn, raw syscall.RawConn, msgs *bindMessages, bufs [][]byte, gso bool) (sent int, failedGSO bool, err error) {
 	for sent < len(bufs) {
-		n, count := packMsgs(msgs, bufs[sent:], addr, gso)
+		n, _ := packMsgs(msgs.messages[:], bufs[sent:], &msgs.addr, gso)
+		msgs.used = max(msgs.used, n)
 		for i := 0; i < n; {
-			k, err := bc.WriteBatch(msgs[i:n], 0)
-			if err != nil {
-				for _, m := range msgs[:i] {
-					sent += len(m.Buffers)
-				}
-				return sent, err
+			k, err := writeBatch(bc, raw, &msgs.send, msgs.messages[i:n])
+			// x/net can pass sendmmsg's raw -1 completion count through.
+			if k < 0 {
+				k = 0
+			}
+			for _, m := range msgs.messages[i : i+k] {
+				sent += len(m.Buffers)
 			}
 			i += k
+			if err != nil {
+				return sent, i < n && len(msgs.messages[i].OOB) > 0 && gsoFailed(err), err
+			}
+			if k == 0 {
+				return sent, false, io.ErrShortWrite
+			}
 		}
-		sent += count
 	}
-	return sent, nil
+	return sent, false, nil
 }
 
 // packMsgs fills msgs from the start of bufs and returns the number of
@@ -278,7 +360,7 @@ func packMsgs(msgs []ipv6.Message, bufs [][]byte, addr *net.UDPAddr, gso bool) (
 	for ; i < len(bufs) && n < len(msgs); n++ {
 		size := len(bufs[i])
 		j, total := i+1, size
-		for gso && j < len(bufs) && j-i < maxGSOSegments && len(bufs[j]) <= size && total+len(bufs[j]) <= maxPayload {
+		for gso && size > 0 && j < len(bufs) && j-i < maxGSOSegments && len(bufs[j]) > 0 && len(bufs[j]) <= size && total+len(bufs[j]) <= maxPayload {
 			total += len(bufs[j])
 			j++
 			if len(bufs[j-1]) < size {
@@ -297,22 +379,23 @@ func packMsgs(msgs []ipv6.Message, bufs [][]byte, addr *net.UDPAddr, gso bool) (
 	return n, i
 }
 
-func (b *bind) getMsgs() *[]ipv6.Message {
-	if m, ok := b.msgsPool.Get().(*[]ipv6.Message); ok {
+func (b *bind) getMsgs() *bindMessages {
+	if m, ok := b.msgsPool.Get().(*bindMessages); ok {
 		return m
 	}
-	msgs := make([]ipv6.Message, conn.IdealBatchSize)
-	for i := range msgs {
-		msgs[i].OOB = make([]byte, 0, gsoControlSize)
+	msgs := new(bindMessages)
+	for i := range msgs.messages {
+		msgs.messages[i].OOB = msgs.control[i][:0]
 	}
-	return &msgs
+	return msgs
 }
 
-func (b *bind) putMsgs(msgs *[]ipv6.Message) {
-	for i := range *msgs {
-		(*msgs)[i].Buffers = nil
-		(*msgs)[i].Addr = nil
+func (b *bind) putMsgs(msgs *bindMessages) {
+	for i := 0; i < msgs.used; i++ {
+		msgs.messages[i].Buffers = nil
+		msgs.messages[i].Addr = nil
 	}
+	msgs.used = 0
 	b.msgsPool.Put(msgs)
 }
 
@@ -348,5 +431,10 @@ func (b *bind) ParseEndpoint(s string) (conn.Endpoint, error) {
 }
 
 func (b *bind) BatchSize() int {
-	return batchSize
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.batchEnabled {
+		return batchSize
+	}
+	return 1
 }

@@ -4,8 +4,9 @@ package wireguard
 
 import (
 	"net"
+	"syscall"
 
-	"github.com/xtls/xray-core/features/stats"
+	"golang.org/x/net/ipv6"
 )
 
 // Without recvmmsg/sendmmsg x/net would send and receive one datagram per
@@ -14,8 +15,8 @@ const batchSize = 1
 
 const gsoControlSize = 0
 
-func newBatchConn(net.PacketConn) (batchConn, bool, stats.Counter, stats.Counter) {
-	return nil, false, nil, nil
+func newBatchConn(*net.UDPConn) (batchConn, bool) {
+	return nil, false
 }
 
 func setGSOSize(oob []byte, _ int) []byte {
@@ -24,4 +25,10 @@ func setGSOSize(oob []byte, _ int) []byte {
 
 func gsoFailed(error) bool {
 	return false
+}
+
+type bindSendmsg struct{}
+
+func writeBatch(bc batchConn, _ syscall.RawConn, _ *bindSendmsg, msgs []ipv6.Message) (int, error) {
+	return bc.WriteBatch(msgs, 0)
 }
