@@ -306,4 +306,3 @@ func BenchmarkWireGuardTCP(b *testing.B) {
 	client, server := newWireGuardTCPPair(b)
 	benchmarkTCPStream(b, client, server)
 }
-
