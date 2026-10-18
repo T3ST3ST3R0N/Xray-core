@@ -51,7 +51,9 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	mb = buf.Compact(mb)
+	if len(mb) > 1 {
+		mb = buf.Compact(mb)
+	}
 	mb, err := buf.WriteMultiBuffer(c, mb)
 	buf.ReleaseMulti(mb)
 	return err

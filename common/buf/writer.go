@@ -15,15 +15,14 @@ type BufferToBytesWriter struct {
 	io.Writer
 
 	counter stats.Counter
-	cache   [][]byte
+	cache   net.Buffers
 }
 
 // WriteMultiBuffer implements Writer. This method takes ownership of the given buffer.
 func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	defer ReleaseMulti(mb)
 
-	size := mb.Len()
-	if size == 0 {
+	if mb.IsEmpty() {
 		return nil
 	}
 
@@ -32,7 +31,7 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	}
 
 	if cap(w.cache) < len(mb) {
-		w.cache = make([][]byte, 0, len(mb))
+		w.cache = make(net.Buffers, 0, len(mb))
 	}
 
 	bs := w.cache
@@ -44,22 +43,22 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 		for idx := range bs {
 			bs[idx] = nil
 		}
+		w.cache = bs[:0]
 	}()
 
-	nb := net.Buffers(bs)
+	w.cache = bs
 	wc := int64(0)
 	defer func() {
 		if w.counter != nil {
 			w.counter.Add(wc)
 		}
 	}()
-	for size > 0 {
-		n, err := nb.WriteTo(w.Writer)
+	for len(w.cache) > 0 {
+		n, err := w.cache.WriteTo(w.Writer)
 		wc += n
 		if err != nil {
 			return err
 		}
-		size -= int32(n)
 	}
 
 	return nil

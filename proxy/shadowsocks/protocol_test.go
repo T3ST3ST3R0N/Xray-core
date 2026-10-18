@@ -1,6 +1,7 @@
 package shadowsocks_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -216,6 +217,81 @@ func TestUDPReaderWriter(t *testing.T) {
 		common.Must(err)
 		if payload[0].String() != "test payload 2" {
 			t.Error("unexpected output: ", payload[0].String())
+		}
+	}
+}
+
+func TestValidatorMixedCiphersPreservesCiphertext(t *testing.T) {
+	ciphers := []CipherType{CipherType_AES_128_GCM, CipherType_AES_256_GCM, CipherType_CHACHA20_POLY1305, CipherType_XCHACHA20_POLY1305}
+	for selectedIndex, selected := range ciphers {
+		t.Run(selected.String(), func(t *testing.T) {
+			validator := new(Validator)
+			for index := range ciphers {
+				if selectedIndex%2 != 0 {
+					index = len(ciphers) - 1 - index
+				}
+				kind := ciphers[index]
+				common.Must(validator.Add(&protocol.MemoryUser{Account: toAccount(&Account{Password: "wrong password", CipherType: kind})}))
+			}
+			user := &protocol.MemoryUser{Account: toAccount(&Account{Password: "correct password", CipherType: selected})}
+			common.Must(validator.Add(user))
+			request := &protocol.RequestHeader{User: user, Address: net.LocalHostIPv6, Port: 1234}
+			payload := bytes.Repeat([]byte("mixed ciphers"), 90)
+			packet, err := EncodeUDPPacket(request, payload)
+			common.Must(err)
+			defer packet.Release()
+			pristine := append([]byte(nil), packet.Bytes()...)
+			matched, _, plain, _, err := validator.Get(packet.Bytes(), protocol.RequestCommandUDP)
+			if err != nil || matched != user || !bytes.HasSuffix(plain, payload) {
+				t.Fatalf("last candidate failed: %v", err)
+			}
+			if !bytes.Equal(packet.Bytes(), pristine) {
+				t.Fatal("candidate trial corrupted ciphertext")
+			}
+			for _, size := range []int{0, 31, 32, 33} {
+				if _, _, _, _, err := validator.Get(packet.Bytes()[:size], protocol.RequestCommandUDP); err == nil {
+					t.Fatal("truncated ciphertext authenticated")
+				}
+			}
+			packet.Bytes()[len(pristine)-1] ^= 1
+			if _, _, _, _, err := validator.Get(packet.Bytes(), protocol.RequestCommandUDP); err == nil {
+				t.Fatal("tampered ciphertext authenticated")
+			}
+			decoded, data, err := DecodeUDPPacket(validator, buf.FromBytes(pristine))
+			if err != nil || decoded.User != user || decoded.Address != request.Address || decoded.Port != request.Port || !bytes.Equal(data.Bytes(), payload) {
+				t.Fatalf("decoded packet mismatch: %v", err)
+			}
+		})
+	}
+}
+
+func TestUDPReaderUserTransition(t *testing.T) {
+	var wire bytes.Buffer
+	reader := &UDPReader{Reader: &wire}
+	var retained buf.MultiBuffer
+	defer func() { buf.ReleaseMulti(retained) }()
+	for index, kind := range []CipherType{CipherType_AES_128_GCM, CipherType_XCHACHA20_POLY1305} {
+		user := &protocol.MemoryUser{Account: toAccount(&Account{Password: kind.String(), CipherType: kind})}
+		reader.User = user
+		for range 2 {
+			payload := bytes.Repeat([]byte{byte(index + 1)}, 1200)
+			request := &protocol.RequestHeader{User: user, Address: net.DomainAddress("example.com"), Port: 1234}
+			packet, err := EncodeUDPPacket(request, payload)
+			common.Must(err)
+			wire.Write(packet.Bytes())
+			packet.Release()
+			mb, err := reader.ReadMultiBuffer()
+			if err != nil || len(mb) != 1 || !bytes.Equal(mb[0].Bytes(), payload) || *mb[0].UDP != net.UDPDestination(request.Address, request.Port) {
+				t.Fatalf("reader user transition failed: %v", err)
+			}
+			if retained != nil && retained[0].Byte(0) != 1 {
+				t.Fatal("previous payload changed")
+			}
+			if retained == nil {
+				retained = mb
+			} else {
+				buf.ReleaseMulti(mb)
+			}
 		}
 	}
 }

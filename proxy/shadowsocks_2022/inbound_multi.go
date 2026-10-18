@@ -290,18 +290,20 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 
 		for _, b := range mb {
 			decoded, userPSK, err := i.decodeUDPPacket(b.Bytes())
-			b.Release()
 			if err != nil {
+				b.Release()
 				continue
 			}
 			sessionItem := decoded.session
 			if sessionItem.closed.Load() {
+				b.Release()
 				continue
 			}
 			sessionItem.UpdateAuthenticatedConn(ctx, conn, decoded.PacketID)
 			link := sessionItem.link.Load()
 			if link == nil {
 				if err := sessionItem.EnsureServerState(i.method, userPSK); err != nil {
+					b.Release()
 					continue
 				}
 				sessionID := decoded.SessionID
@@ -309,20 +311,22 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 					return sessionItem.EncodeServerPacket(i.method, sessionID, replyDest, payload)
 				})
 				if err != nil {
+					b.Release()
 					continue
 				}
 			}
 
-			pBuf := buf.New()
-			pBuf.Write(decoded.Payload)
-			pBuf.UDP = &decoded.Destination
-			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{pBuf})
+			start := b.Len() - AEADTagSize - int32(len(decoded.Payload))
+			b.Resize(start, start+int32(len(decoded.Payload)))
+			b.UDP = &decoded.Destination
+			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
 		}
 	}
 }
 
 // decodeUDPPacket commits the authenticated cipher, replay state and user as
 // one receive operation. No dispatcher or packet writer is called under its lock.
+// It consumes packetBytes in place; successful Payload aliases that input.
 func (i *MultiUserInbound) decodeUDPPacket(packetBytes []byte) (DecodedUDPPacket, []byte, error) {
 	if len(packetBytes) < 32+1+8+2 {
 		return DecodedUDPPacket{}, nil, ErrPacketTooShort

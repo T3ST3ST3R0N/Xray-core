@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/antireplay"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -72,7 +73,6 @@ func NewStreamWriter(w io.Writer, c cipher.AEAD) *StreamWriter {
 	return &StreamWriter{
 		writer: w,
 		cipher: c,
-		buf:    make([]byte, 0, MaxPacketSize+2+2*AEADTagSize),
 	}
 }
 
@@ -80,6 +80,8 @@ func (w *StreamWriter) Nonce() []byte {
 	return w.nonce[:]
 }
 
+// WriteChunk writes one authenticated frame and reports io.ErrShortWrite when
+// the underlying writer accepts only part of it. A failed stream cannot be reused.
 func (w *StreamWriter) WriteChunk(payload []byte) error {
 	payloadLen := len(payload)
 	if payloadLen == 0 {
@@ -89,6 +91,10 @@ func (w *StreamWriter) WriteChunk(payload []byte) error {
 		return errors.New("payload exceeds MaxPacketSize")
 	}
 
+	size := payloadLen + 2 + 2*AEADTagSize
+	if cap(w.buf) < size {
+		w.buf = make([]byte, 0, size)
+	}
 	binary.BigEndian.PutUint16(w.lenBuf[:], uint16(payloadLen))
 	w.buf = w.cipher.Seal(w.buf[:0], w.nonce[:], w.lenBuf[:], nil)
 	IncreaseNonce(w.nonce[:])
@@ -96,10 +102,14 @@ func (w *StreamWriter) WriteChunk(payload []byte) error {
 	w.buf = w.cipher.Seal(w.buf, w.nonce[:], payload, nil)
 	IncreaseNonce(w.nonce[:])
 
-	_, err := w.writer.Write(w.buf)
+	n, err := w.writer.Write(w.buf)
+	if err == nil && n != len(w.buf) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
+// Write returns the plaintext bytes in fully written chunks before any error.
 func (w *StreamWriter) Write(p []byte) (int, error) {
 	n := len(p)
 	for len(p) > 0 {
@@ -108,13 +118,14 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 			chunkSize = MaxPacketSize
 		}
 		if err := w.WriteChunk(p[:chunkSize]); err != nil {
-			return 0, err
+			return n - len(p), err
 		}
 		p = p[chunkSize:]
 	}
 	return n, nil
 }
 
+// WriteMultiBuffer consumes mb, including on write failure.
 func (w *StreamWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 	for _, b := range mb {
@@ -147,7 +158,6 @@ func NewStreamReader(r io.Reader, c cipher.AEAD) *StreamReader {
 	return &StreamReader{
 		reader: r,
 		cipher: c,
-		buffer: make([]byte, MaxPacketSize+AEADTagSize),
 	}
 }
 
@@ -155,50 +165,60 @@ func (r *StreamReader) Nonce() []byte {
 	return r.nonce[:]
 }
 
-func (r *StreamReader) Read(p []byte) (int, error) {
-	if r.cached > 0 {
-		n := copy(p, r.buffer[r.offset:r.offset+r.cached])
-		r.cached -= n
-		r.offset += n
-		return n, nil
-	}
-
-	// Read 2-byte length + AEAD tag (18 bytes)
+func (r *StreamReader) readLength() (int, error) {
 	if _, err := io.ReadFull(r.reader, r.lenBuf[:]); err != nil {
 		return 0, err
 	}
-
-	decryptedLen, err := r.cipher.Open(r.lenBuf[:0], r.nonce[:], r.lenBuf[:], nil)
+	plain, err := r.cipher.Open(r.lenBuf[:0], r.nonce[:], r.lenBuf[:], nil)
 	if err != nil {
 		return 0, errors.New("failed to decrypt chunk length").Base(err)
 	}
 	IncreaseNonce(r.nonce[:])
-
-	payloadLen := int(binary.BigEndian.Uint16(decryptedLen))
-	if payloadLen == 0 || payloadLen > MaxPacketSize {
+	length := int(binary.BigEndian.Uint16(plain))
+	if length == 0 || length > MaxPacketSize {
 		return 0, ErrInvalidRequest
 	}
+	return length, nil
+}
 
-	chunkEnd := payloadLen + AEADTagSize
-	if _, err := io.ReadFull(r.reader, r.buffer[:chunkEnd]); err != nil {
-		return 0, err
+func (r *StreamReader) readPayload(ciphertext []byte) error {
+	if _, err := io.ReadFull(r.reader, ciphertext); err != nil {
+		return err
 	}
-
-	decryptedPayload, err := r.cipher.Open(r.buffer[:0], r.nonce[:], r.buffer[:chunkEnd], nil)
-	if err != nil {
-		return 0, errors.New("failed to decrypt chunk payload").Base(err)
+	if _, err := r.cipher.Open(ciphertext[:0], r.nonce[:], ciphertext, nil); err != nil {
+		return errors.New("failed to decrypt chunk payload").Base(err)
 	}
 	IncreaseNonce(r.nonce[:])
+	return nil
+}
 
-	r.cached = len(decryptedPayload)
-	r.offset = 0
-
+func (r *StreamReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.cached == 0 {
+		length, err := r.readLength()
+		if err != nil {
+			return 0, err
+		}
+		size := length + AEADTagSize
+		if cap(r.buffer) < size {
+			r.buffer = make([]byte, size)
+		}
+		if err := r.readPayload(r.buffer[:size]); err != nil {
+			return 0, err
+		}
+		r.cached = length
+		r.offset = 0
+	}
 	n := copy(p, r.buffer[r.offset:r.offset+r.cached])
 	r.cached -= n
 	r.offset += n
 	return n, nil
 }
 
+// ReadMultiBuffer returns caller-owned plaintext that survives subsequent reads.
+// Authentication and truncated-frame errors return no plaintext.
 func (r *StreamReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if r.cached > 0 {
 		mb := buf.MergeBytes(nil, r.buffer[r.offset:r.offset+r.cached])
@@ -207,34 +227,53 @@ func (r *StreamReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return mb, nil
 	}
 
-	if _, err := io.ReadFull(r.reader, r.lenBuf[:]); err != nil {
+	length, err := r.readLength()
+	if err != nil {
 		return nil, err
 	}
-
-	decryptedLen, err := r.cipher.Open(r.lenBuf[:0], r.nonce[:], r.lenBuf[:], nil)
-	if err != nil {
-		return nil, errors.New("failed to decrypt chunk length").Base(err)
+	size := length + AEADTagSize
+	if size <= buf.Size {
+		b := buf.NewWithSize(int32(size))
+		if _, err := b.ReadFullFrom(r.reader, int32(size)); err != nil {
+			b.Release()
+			return nil, err
+		}
+		ciphertext := b.Bytes()
+		if _, err := r.cipher.Open(ciphertext[:0], r.nonce[:], ciphertext, nil); err != nil {
+			b.Release()
+			return nil, errors.New("failed to decrypt chunk payload").Base(err)
+		}
+		IncreaseNonce(r.nonce[:])
+		b.Resize(0, int32(length))
+		return buf.MultiBuffer{b}, nil
 	}
-	IncreaseNonce(r.nonce[:])
 
-	payloadLen := int(binary.BigEndian.Uint16(decryptedLen))
-	if payloadLen == 0 || payloadLen > MaxPacketSize {
-		return nil, ErrInvalidRequest
+	if cap(r.buffer) < size {
+		r.buffer = make([]byte, size)
+	}
+	if length <= buf.Size {
+		// Keep an 8K plaintext buffer when the tag spills past the 8K pool:
+		// ciphertext scratch is reusable, but returned plaintext is caller-owned.
+		if _, err := io.ReadFull(r.reader, r.buffer[:size]); err != nil {
+			return nil, err
+		}
+		output := bytespool.Alloc(buf.Size)[:buf.Size:buf.Size]
+		plain, err := r.cipher.Open(output[:0], r.nonce[:], r.buffer[:size], nil)
+		if err != nil {
+			bytespool.Free(output)
+			return nil, errors.New("failed to decrypt chunk payload").Base(err)
+		}
+		IncreaseNonce(r.nonce[:])
+		return buf.MultiBuffer{buf.NewExisted(plain)}, nil
 	}
 
-	chunkEnd := payloadLen + AEADTagSize
-	if _, err := io.ReadFull(r.reader, r.buffer[:chunkEnd]); err != nil {
+	// Chained Vision writers reshape into regular buffers (ReshapeMultiBuffer),
+	// so large peer chunks retain scratch and split rather than transfer a
+	// single oversized buffer. The wire limit remains MaxPacketSize (65535).
+	if err := r.readPayload(r.buffer[:size]); err != nil {
 		return nil, err
 	}
-
-	decryptedPayload, err := r.cipher.Open(r.buffer[:0], r.nonce[:], r.buffer[:chunkEnd], nil)
-	if err != nil {
-		return nil, errors.New("failed to decrypt chunk payload").Base(err)
-	}
-	IncreaseNonce(r.nonce[:])
-
-	mb := buf.MergeBytes(nil, decryptedPayload)
-	return mb, nil
+	return buf.MergeBytes(nil, r.buffer[:length]), nil
 }
 
 type ClientRequestHeader struct {
@@ -388,8 +427,12 @@ func WriteTCPRequest(w io.Writer, method *CipherMethod, pskList [][]byte, dest n
 	IncreaseNonce(writer.nonce[:])
 	handshakeBuf.Write(varChunk)
 
-	if _, err := w.Write(handshakeBuf.Bytes()); err != nil {
+	n, err := w.Write(handshakeBuf.Bytes())
+	if err != nil {
 		return nil, err
+	}
+	if n != int(handshakeBuf.Len()) {
+		return nil, io.ErrShortWrite
 	}
 
 	return writer, nil
@@ -446,6 +489,9 @@ func ReadTCPResponse(r io.Reader, method *CipherMethod, psk []byte, clientSalt [
 	initialPayloadLen := int(binary.BigEndian.Uint16(decryptedFixed[9+method.KeySaltLength : 11+method.KeySaltLength]))
 	if initialPayloadLen > 0 {
 		initialCipherLen := initialPayloadLen + AEADTagSize
+		if cap(reader.buffer) < initialCipherLen {
+			reader.buffer = make([]byte, initialCipherLen)
+		}
 		if _, err := io.ReadFull(r, reader.buffer[:initialCipherLen]); err != nil {
 			return nil, err
 		}
@@ -517,8 +563,12 @@ func (s *ServerStreamWriter) sendHeaderWithFirstPayload(payload []byte) (*Stream
 		outBuf.Write(payloadChunk)
 	}
 
-	if _, err := s.w.Write(outBuf.Bytes()); err != nil {
+	n, err := s.w.Write(outBuf.Bytes())
+	if err != nil {
 		return nil, err
+	}
+	if n != int(outBuf.Len()) {
+		return nil, io.ErrShortWrite
 	}
 	return sw, nil
 }

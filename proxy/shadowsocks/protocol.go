@@ -280,8 +280,10 @@ func DecodeUDPPacket(validator *Validator, payload *buf.Buffer) (*protocol.Reque
 }
 
 type UDPReader struct {
-	Reader io.Reader
-	User   *protocol.MemoryUser
+	Reader        io.Reader
+	User          *protocol.MemoryUser
+	validator     *Validator
+	validatorUser *protocol.MemoryUser
 }
 
 func (v *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -291,10 +293,17 @@ func (v *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		buffer.Release()
 		return nil, err
 	}
-	validator := new(Validator)
-	validator.Add(v.User)
+	if v.validator == nil || v.validatorUser != v.User {
+		validator := new(Validator)
+		if err := validator.Add(v.User); err != nil {
+			buffer.Release()
+			return nil, err
+		}
+		v.validator = validator
+		v.validatorUser = v.User
+	}
 
-	u, payload, err := DecodeUDPPacket(validator, buffer)
+	u, payload, err := DecodeUDPPacket(v.validator, buffer)
 	if err != nil {
 		buffer.Release()
 		return nil, err

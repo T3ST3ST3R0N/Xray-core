@@ -114,6 +114,9 @@ func (v *Validator) Get(bs []byte, command protocol.RequestCommand) (u *protocol
 	v.RLock()
 	defer v.RUnlock()
 
+	var subkey [32]byte
+	var nonce [24]byte
+	var data []byte
 	for _, user := range v.users {
 		if account := user.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
 			// AEAD payload decoding requires the payload to be over 32 bytes
@@ -123,20 +126,30 @@ func (v *Validator) Get(bs []byte, command protocol.RequestCommand) (u *protocol
 
 			aeadCipher := account.Cipher.(*AEADCipher)
 			ivLen = aeadCipher.IVSize()
+			if len(bs) < int(ivLen)+18 {
+				continue
+			}
 			iv := bs[:ivLen]
-			subkey := make([]byte, 32)
-			subkey = subkey[:aeadCipher.KeyBytes]
-			hkdfSHA1(account.Key, iv, subkey)
-			aead = aeadCipher.AEADAuthCreator(subkey)
+			key := subkey[:aeadCipher.KeyBytes]
+			hkdfSHA1(account.Key, iv, key)
+			aead = aeadCipher.AEADAuthCreator(key)
 
 			var matchErr error
 			switch command {
 			case protocol.RequestCommandTCP:
-				data := make([]byte, 4+aead.NonceSize())
-				ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
+				if cap(data) < 2 {
+					data = make([]byte, 2)
+				}
+				ret, matchErr = aead.Open(data[:0], nonce[:aead.NonceSize()], bs[ivLen:ivLen+18], nil)
 			case protocol.RequestCommandUDP:
-				data := make([]byte, 8192)
-				ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
+				size := len(bs) - int(ivLen) - aead.Overhead()
+				if size < 0 {
+					continue
+				}
+				if cap(data) < size {
+					data = make([]byte, size)
+				}
+				ret, matchErr = aead.Open(data[:0], nonce[:aead.NonceSize()], bs[ivLen:], nil)
 			}
 
 			if matchErr == nil {

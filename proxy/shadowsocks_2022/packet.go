@@ -91,7 +91,9 @@ type DecodedUDPPacket struct {
 	Timestamp       uint64
 	ClientSessionID uint64
 	Destination     net.Destination
-	Payload         []byte
+	// Payload aliases the consumed ciphertext input. The caller must retain its
+	// backing storage until the payload consumer has finished.
+	Payload []byte
 }
 
 func DecryptUDPEIH(block cipher.Block, rawHeader, eih []byte) [AESBlockSize]byte {
@@ -188,6 +190,9 @@ func parsePlainUDPPacket(sessionID, packetID uint64, bodyPlain []byte) (DecodedU
 	}, nil
 }
 
+// DecodePacket consumes data, decrypting its body in place. On success Payload
+// aliases data; on failure data may be overwritten and no plaintext is returned.
+// Copy ciphertext before calling if it must be retained (including replay tests).
 func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 	if len(data) < PacketMinimalHeaderSize {
 		return DecodedUDPPacket{}, ErrPacketTooShort
@@ -199,7 +204,7 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 		}
 		nonce := data[:PacketNonceSize]
 		ciphertext := data[PacketNonceSize:]
-		plain, err := c.chachaCipher.Open(nil, nonce, ciphertext, nil)
+		plain, err := c.chachaCipher.Open(ciphertext[:0], nonce, ciphertext, nil)
 		if err != nil {
 			return DecodedUDPPacket{}, errors.New("failed to decrypt chacha udp packet").Base(err)
 		}
@@ -245,6 +250,9 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 	return sessionItem.DecryptAESPayload(c.method, c.psk, sessionID, packetID, rawHeader[:], data[16:])
 }
 
+// DecryptAESPayload consumes bodyCipher in place. The returned Payload aliases
+// bodyCipher, which must remain owned by the caller until its consumer is done.
+// rawHeader must not overlap bodyCipher; failures may overwrite bodyCipher.
 func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, sessionID, packetID uint64, rawHeader, bodyCipher []byte) (DecodedUDPPacket, error) {
 	s.receiveMu.Lock()
 	defer s.receiveMu.Unlock()
@@ -270,7 +278,7 @@ func (s *ServerUDPSession) decryptAESPayload(method *CipherMethod, psk []byte, s
 	}
 
 	bodyNonce := rawHeader[4:16]
-	bodyPlain, err := bodyAead.Open(nil, bodyNonce, bodyCipher, nil)
+	bodyPlain, err := bodyAead.Open(bodyCipher[:0], bodyNonce, bodyCipher, nil)
 	if err != nil {
 		return DecodedUDPPacket{}, errors.New("failed to decrypt aes udp body").Base(err)
 	}
@@ -343,8 +351,14 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 			return nil, err
 		}
 
-		plainBuf := buf.New()
-		defer plainBuf.Release()
+		plainLen := 35 + AddrPortLength(dest) + len(payload)
+		if PacketNonceSize+plainLen+AEADTagSize > buf.Size {
+			return nil, ErrPacketTooLarge
+		}
+		res := make([]byte, PacketNonceSize+plainLen+AEADTagSize)
+		copy(res, nonce[:])
+		plainBuf := buf.FromBytes(res[PacketNonceSize : PacketNonceSize+plainLen])
+		plainBuf.Clear()
 
 		var hdr [16 + 1 + 8 + 8 + 2]byte
 		binary.BigEndian.PutUint64(hdr[0:8], serverSessionID)
@@ -358,13 +372,10 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 		if err := WriteAddressPort(plainBuf, dest); err != nil {
 			return nil, err
 		}
-		plainBuf.Write(payload)
-
-		sealed := s.serverChaCha.Seal(nil, nonce[:], plainBuf.Bytes(), nil)
-		res := make([]byte, PacketNonceSize+len(sealed))
-		copy(res[:PacketNonceSize], nonce[:])
-		copy(res[PacketNonceSize:], sealed)
-		return res, nil
+		if _, err := plainBuf.Write(payload); err != nil {
+			return nil, err
+		}
+		return s.serverChaCha.Seal(res[:PacketNonceSize], nonce[:], plainBuf.Bytes(), nil), nil
 	}
 
 	// AES mode
@@ -372,11 +383,14 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	binary.BigEndian.PutUint64(rawHeader[:8], serverSessionID)
 	binary.BigEndian.PutUint64(rawHeader[8:16], serverPacketID)
 
-	var encryptedHeader [16]byte
-	s.serverHeaderBlock.Encrypt(encryptedHeader[:], rawHeader[:])
-
-	bodyBuf := buf.New()
-	defer bodyBuf.Release()
+	plainLen := 19 + AddrPortLength(dest) + len(payload)
+	if 16+plainLen+AEADTagSize > buf.Size {
+		return nil, ErrPacketTooLarge
+	}
+	res := make([]byte, 16+plainLen+AEADTagSize)
+	s.serverHeaderBlock.Encrypt(res[:16], rawHeader[:])
+	bodyBuf := buf.FromBytes(res[16 : 16+plainLen])
+	bodyBuf.Clear()
 
 	var hdr [1 + 8 + 8 + 2]byte
 	hdr[0] = HeaderTypeServer
@@ -388,15 +402,11 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	if err := WriteAddressPort(bodyBuf, dest); err != nil {
 		return nil, err
 	}
-	bodyBuf.Write(payload)
-
+	if _, err := bodyBuf.Write(payload); err != nil {
+		return nil, err
+	}
 	bodyNonce := rawHeader[4:16]
-	sealedBody := s.serverBodyCipher.Seal(nil, bodyNonce, bodyBuf.Bytes(), nil)
-
-	res := make([]byte, 16+len(sealedBody))
-	copy(res[:16], encryptedHeader[:])
-	copy(res[16:], sealedBody)
-	return res, nil
+	return s.serverBodyCipher.Seal(res[:16], bodyNonce, bodyBuf.Bytes(), nil), nil
 }
 
 type serverSessionState struct {
@@ -623,6 +633,9 @@ func (s *ClientUDPSession) EncodePacket(dest net.Destination, payload []byte) (*
 	return outBuf, nil
 }
 
+// DecodePacket consumes data in place. The returned Payload aliases data and
+// stays valid until its owner releases or overwrites data. Failures may mutate
+// data but never return plaintext; save a copy first when retaining ciphertext.
 func (s *ClientUDPSession) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 	if len(data) < PacketMinimalHeaderSize {
 		return DecodedUDPPacket{}, ErrPacketTooShort
@@ -634,7 +647,7 @@ func (s *ClientUDPSession) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 		}
 		nonce := data[:PacketNonceSize]
 		ciphertext := data[PacketNonceSize:]
-		plain, err := s.codec.chachaCipher.Open(nil, nonce, ciphertext, nil)
+		plain, err := s.codec.chachaCipher.Open(ciphertext[:0], nonce, ciphertext, nil)
 		if err != nil {
 			return DecodedUDPPacket{}, errors.New("failed to decrypt chacha udp packet").Base(err)
 		}
@@ -690,7 +703,7 @@ func (s *ClientUDPSession) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 
 	bodyNonce := rawHeader[4:16]
 	bodyCipher := data[16:]
-	bodyPlain, err := bodyAead.Open(nil, bodyNonce, bodyCipher, nil)
+	bodyPlain, err := bodyAead.Open(bodyCipher[:0], bodyNonce, bodyCipher, nil)
 	if err != nil {
 		return DecodedUDPPacket{}, errors.New("failed to decrypt aes udp body").Base(err)
 	}
@@ -765,8 +778,8 @@ func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			buffer.Release()
 			continue
 		}
-		buffer.Clear()
-		buffer.Write(decoded.Payload)
+		start := buffer.Len() - AEADTagSize - int32(len(decoded.Payload))
+		buffer.Resize(start, start+int32(len(decoded.Payload)))
 		dest := decoded.Destination
 		buffer.UDP = &dest
 		return buf.MultiBuffer{buffer}, nil

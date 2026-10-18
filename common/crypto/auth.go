@@ -284,6 +284,29 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 	}
 
 	payloadSize := buf.Size - int32(w.auth.Overhead()) - w.sizeParser.SizeBytes() - maxPadding
+	if len(mb) == 1 && mb[0].Len() <= payloadSize {
+		eb, err := w.seal(mb[0].Bytes())
+		if err != nil {
+			return err
+		}
+		return w.writer.WriteMultiBuffer(buf.MultiBuffer{eb})
+	}
+	if len(mb) == 1 && payloadSize > 0 {
+		rawBytes := mb[0].Bytes()
+		mb2Write := make(buf.MultiBuffer, 0, (len(rawBytes)-1)/int(payloadSize)+1)
+		for len(rawBytes) > 0 {
+			size := min(len(rawBytes), int(payloadSize))
+			eb, err := w.seal(rawBytes[:size:size])
+			if err != nil {
+				buf.ReleaseMulti(mb2Write)
+				return err
+			}
+			mb2Write = append(mb2Write, eb)
+			rawBytes = rawBytes[size:]
+		}
+		buf.ReleaseMulti(mb)
+		return w.writer.WriteMultiBuffer(mb2Write)
+	}
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+10)
 
 	temp := buf.New()
@@ -334,7 +357,8 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 	return w.writer.WriteMultiBuffer(mb2Write)
 }
 
-// WriteMultiBuffer implements buf.Writer.
+// WriteMultiBuffer implements buf.Writer, consuming nonempty mb even on error.
+// Stream ciphertext owns separate storage and remains valid after mb is released.
 func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if mb.IsEmpty() {
 		eb, err := w.seal([]byte{})

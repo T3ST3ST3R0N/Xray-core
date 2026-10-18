@@ -100,7 +100,8 @@ type PacketWriter struct {
 	Target net.Destination
 }
 
-// WriteMultiBuffer implements buf.Writer
+// WriteMultiBuffer consumes mb even on error. A partial frame write returns
+// io.ErrShortWrite; payloads larger than maxLength are rejected.
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	for {
 		mb2, b := buf.SplitFirst(mb)
@@ -123,13 +124,23 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (w *PacketWriter) writePacket(payload []byte, dest net.Destination) (int, error) {
-	buffer := buf.StackNew()
+	length := len(payload)
+	if length > maxLength {
+		return 0, errors.New("oversize payload")
+	}
+	addressLength := 1 + 16 + 2
+	switch dest.Address.Family() {
+	case net.AddressFamilyIPv4:
+		addressLength = 1 + 4 + 2
+	case net.AddressFamilyDomain:
+		addressLength = 1 + 1 + len(dest.Address.Domain()) + 2
+	}
+	buffer := buf.NewWithSize(int32(addressLength + 4 + length))
 	defer buffer.Release()
 
-	length := len(payload)
 	lengthBuf := [2]byte{}
 	binary.BigEndian.PutUint16(lengthBuf[:], uint16(length))
-	if err := addrParser.WriteAddressPort(&buffer, dest.Address, dest.Port); err != nil {
+	if err := addrParser.WriteAddressPort(buffer, dest.Address, dest.Port); err != nil {
 		return 0, err
 	}
 	if _, err := buffer.Write(lengthBuf[:]); err != nil {
@@ -141,9 +152,12 @@ func (w *PacketWriter) writePacket(payload []byte, dest net.Destination) (int, e
 	if _, err := buffer.Write(payload); err != nil {
 		return 0, err
 	}
-	_, err := w.Write(buffer.Bytes())
+	n, err := w.Write(buffer.Bytes())
 	if err != nil {
 		return 0, err
+	}
+	if n != int(buffer.Len()) {
+		return 0, io.ErrShortWrite
 	}
 
 	return length, nil

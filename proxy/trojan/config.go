@@ -3,7 +3,6 @@ package trojan
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 
 	"google.golang.org/protobuf/proto"
 
@@ -50,9 +49,5 @@ func hexSha224(password string) []byte {
 }
 
 func hexString(data []byte) string {
-	str := ""
-	for _, v := range data {
-		str += fmt.Sprintf("%02x", v)
-	}
-	return str
+	return hex.EncodeToString(data)
 }

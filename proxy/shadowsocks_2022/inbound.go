@@ -156,13 +156,14 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 
 		for _, b := range mb {
 			decoded, err := i.udpCodec.DecodePacket(b.Bytes())
-			b.Release()
 			if err != nil || decoded.HeaderType != HeaderTypeClient {
+				b.Release()
 				continue
 			}
 
 			sessionItem := decoded.session
 			if sessionItem.closed.Load() {
+				b.Release()
 				continue
 			}
 			sessionItem.userMu.Lock()
@@ -174,6 +175,7 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 			link := sessionItem.link.Load()
 			if link == nil {
 				if err := sessionItem.EnsureServerState(i.udpCodec.method, i.udpCodec.psk); err != nil {
+					b.Release()
 					continue
 				}
 				sessionID := decoded.SessionID
@@ -181,14 +183,15 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 					return sessionItem.EncodeServerPacket(i.udpCodec.method, sessionID, dest, payload)
 				})
 				if err != nil {
+					b.Release()
 					continue
 				}
 			}
 
-			payloadBuf := buf.New()
-			payloadBuf.Write(decoded.Payload)
-			payloadBuf.UDP = &decoded.Destination
-			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{payloadBuf})
+			start := b.Len() - AEADTagSize - int32(len(decoded.Payload))
+			b.Resize(start, start+int32(len(decoded.Payload)))
+			b.UDP = &decoded.Destination
+			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
 		}
 	}
 }
