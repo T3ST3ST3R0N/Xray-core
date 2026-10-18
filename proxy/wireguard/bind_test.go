@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"net/netip"
 	"os"
@@ -28,7 +29,7 @@ func openTestBind(t *testing.T, network, addr string, reserved []byte) (*bind, c
 	b := &bind{
 		reserved:     reserved,
 		batchEnabled: true,
-		listenFunc: func() (net.PacketConn, error) {
+		listenFunc: func(context.Context) (net.PacketConn, error) {
 			c, err := net.ListenPacket(network, addr)
 			if err != nil {
 				return nil, err
@@ -369,7 +370,7 @@ func TestBindFallbackDeliveryAndBatchBound(t *testing.T) {
 			b := &bind{
 				batchEnabled: optIn,
 				reserved:     []byte{1, 2, 3},
-				listenFunc: func() (net.PacketConn, error) {
+				listenFunc: func(context.Context) (net.PacketConn, error) {
 					c, err := net.ListenPacket("udp4", "127.0.0.1:0")
 					if err != nil {
 						return nil, err
