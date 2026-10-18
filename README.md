@@ -39,12 +39,6 @@
 
 [Project X Official Website](https://xtls.github.io)
 
-### WireGuard native UDP
-
-Known native UDP listeners advertise Linux batching before the WireGuard device allocates its pools. FinalMask, configured `dialerProxy`, custom listeners and non-Linux platforms retain a single-packet bound; opening a socket can only reduce that bound.
-
-Native singleton sends avoid batch metadata. Eligible Linux datagrams use scatter-gather UDP GSO without coalescing payloads; unsupported-offload or path-MTU errors disable GSO for that socket and retry only its unsent suffix through ordinary batching. Counters include only completed datagrams, including a completed prefix returned with an error. The built-in TUN continues to use Xray's shared `proxy/tun` stack.
-
 ## Telegram
 
 [Project X](https://t.me/projectXray)
