@@ -130,6 +130,10 @@ func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher rout
 
 	errors.LogInfo(ctx, "tunneling request to ", dest)
 
+	if isSingUoT(dest) {
+		return processSingUoT(ctx, conn, dest, reqHeader.EarlyData, reader, writer, dispatcher, i.policyManager.ForLevel(uint32(i.user.Level)))
+	}
+
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return err

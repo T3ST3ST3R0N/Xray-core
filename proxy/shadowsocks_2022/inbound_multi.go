@@ -264,6 +264,10 @@ func (i *MultiUserInbound) processTCP(ctx context.Context, conn net.Conn, dispat
 
 	errors.LogInfo(ctx, "tunneling request to ", dest, " for user ", user.Email)
 
+	if isSingUoT(dest) {
+		return processSingUoT(ctx, conn, dest, reqHeader.EarlyData, reader, writer, dispatcher, i.policyManager.ForLevel(user.Level))
+	}
+
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return err

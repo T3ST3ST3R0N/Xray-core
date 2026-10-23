@@ -44,3 +44,7 @@ jobs:
 
       - name: Connect the official client to this build
         run: go test -timeout 30m -v -run TestUpstreamClient ./testing/scenarios
+
+      - name: Verify legacy sing UDP-over-TCP compatibility
+        if: matrix.release == 'v26.3.27'
+        run: XRAY_UOT_CLIENT="$XRAY_UPSTREAM" go test -timeout 5m -v -run '^TestSingUoTClient$' ./testing/scenarios
