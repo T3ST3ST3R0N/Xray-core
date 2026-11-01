@@ -53,7 +53,7 @@ jobs:
             if [ "$arch" = armv7l ]; then
               goarch=arm
             fi
-            GOARCH="$goarch" GOARM=7 go build -o "dist/xray-linux-$arch" -trimpath -buildvcs=false -gcflags="all=-l=4"-ldflags="-X github.com/xtls/xray-core/core.build=${BUILD} -s -w -buildid=" -v ./main
+            GOARCH="$goarch" GOARM=7 go build -o "dist/xray-linux-$arch" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${BUILD} -s -w -buildid=" -v ./main
           done
           cd dist && sha256sum xray-* > sha256sums.txt
 
