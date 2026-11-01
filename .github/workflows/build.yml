@@ -37,7 +37,7 @@ jobs:
         id: version
         run: |
           VER=$(awk '/Version_[xyz] byte =/ {print $NF}' core/core.go | paste -sd.)
-          LAST=$(git ls-remote --tags origin "refs/tags/v${VER}-dev.*" | grep -v '\^{}' | sed 's|.*-dev\.||' | sort -n | tail -n 1)
+          LAST=$(git ls-remote --tags origin "refs/tags/v${VER}-dev.*" | grep -v '\^{}' | sed 's|.*-dev\.||' | sort -n | tail-n 1)
           echo "tag=v${VER}-dev.$((LAST + 1))" >> "$GITHUB_OUTPUT"
 
       - name: Build Xray
@@ -48,8 +48,12 @@ jobs:
         run: |
           mkdir dist
           BUILD="${TAG#*-}-$(git rev-parse --short HEAD)"
-          for arch in amd64 arm64; do
-            GOARCH=$arch go build -o dist/xray-linux-$arch -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${BUILD} -s -w -buildid=" -v ./main
+          for arch in amd64 arm64 armv7l; do
+            goarch="$arch"
+            if [ "$arch" = armv7l ]; then
+              goarch=arm
+            fi
+            GOARCH="$goarch" GOARM=7 go build -o "dist/xray-linux-$arch" -trimpath -buildvcs=false -gcflags="all=-l=4"-ldflags="-X github.com/xtls/xray-core/core.build=${BUILD} -s -w -buildid=" -v ./main
           done
           cd dist && sha256sum xray-* > sha256sums.txt
 
