@@ -1,0 +1,16 @@
+{
+  "repository": "XTLS/Xray-rules-dat",
+  "revision": "9694e3e2f1f74bcd3435de898ceb3ba73e25b3f2",
+  "assets": [
+    {
+      "name": "geoip.dat",
+      "path": "geoip/geoip-lite.dat",
+      "sha256": "254c362f410baa2b82deb93717eac423aa97d9515d785a67ea50549d27ae9864"
+    },
+    {
+      "name": "geosite.dat",
+      "path": "geosite/geosite.dat",
+      "sha256": "e7b1731e662bd59df55e66dfa65dbed419212ea616f80fd4b253ab75d9b61ded"
+    }
+  ]
+}

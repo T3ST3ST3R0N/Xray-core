@@ -59,6 +59,8 @@ jobs:
       - name: Build and test the merge
         if: steps.merge.outputs.uptodate != 'true'
         run: |
+          python3 .github/scripts/test_ensure_geodata.py
+          python3 .github/scripts/ensure-geodata.py
           go run ./infra/vformat/main.go -mode check
           go build ./...
           go test -timeout 1h ./...

@@ -96,4 +96,8 @@ jobs:
           key: xray-geodat-
           enableCrossOsArchive: true
       - name: Test
-        run: go test -timeout 1h -v ./...
+        shell: bash
+        run: |
+          python3 .github/scripts/test_ensure_geodata.py
+          python3 .github/scripts/ensure-geodata.py
+          go test -timeout 1h -v ./...
