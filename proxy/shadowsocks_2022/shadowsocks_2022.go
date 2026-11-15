@@ -94,6 +94,7 @@ func (s *ServerUDPSession) end() {
 
 func (s *ServerUDPSession) Close() {
 	s.closed.Store(true)
+	s.closeDestinationRoutes()
 	s.currentConn.Lock()
 	if s.currentConn.stop != nil {
 		s.currentConn.stop()

@@ -304,26 +304,23 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 				continue
 			}
 			sessionItem.UpdateAuthenticatedConn(ctx, conn, decoded.PacketID)
-			link := sessionItem.link.Load()
-			if link == nil {
-				if err := sessionItem.EnsureServerState(i.method, userPSK); err != nil {
-					b.Release()
-					continue
-				}
-				sessionID := decoded.SessionID
-				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(replyDest net.Destination, payload []byte) ([]byte, error) {
-					return sessionItem.EncodeServerPacket(i.method, sessionID, replyDest, payload)
-				})
-				if err != nil {
-					b.Release()
-					continue
-				}
+			if err := sessionItem.EnsureServerState(i.method, userPSK); err != nil {
+				b.Release()
+				continue
+			}
+			sessionID := decoded.SessionID
+			route, err := sessionItem.ensureDestinationRoute(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(dest net.Destination, payload []byte) ([]byte, error) {
+				return sessionItem.EncodeServerPacket(i.method, sessionID, dest, payload)
+			})
+			if err != nil {
+				b.Release()
+				continue
 			}
 
 			start := b.Len() - AEADTagSize - int32(len(decoded.Payload))
 			b.Resize(start, start+int32(len(decoded.Payload)))
 			b.UDP = &decoded.Destination
-			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
+			sessionItem.writeDestinationPacket(route, b)
 		}
 	}
 }

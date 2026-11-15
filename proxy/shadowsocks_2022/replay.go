@@ -101,6 +101,8 @@ type ServerUDPSession struct {
 	timer       atomic.Pointer[signal.ActivityTimer]
 	currentConn udpReturnPath
 	closed      atomic.Bool
+
+	destinationRoutes udpDestinationRoutes
 }
 
 func (s *ServerUDPSession) CheckPacketID(packetID uint64) bool {
