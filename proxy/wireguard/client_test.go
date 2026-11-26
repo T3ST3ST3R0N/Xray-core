@@ -153,7 +153,7 @@ func TestClientRetriesFailedSetup(t *testing.T) {
 func TestResolveLocalPrefersIPv4(t *testing.T) {
 	resolve := MakeResolveLocal(&testDNS{ips: []net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("192.0.2.1")}}, &internet.MemoryStreamConfig{})
 	for i := 0; i < 50; i++ {
-		ip, err := resolve("relay.test")
+		ip, err := resolve(context.Background(), "relay.test")
 		if err != nil {
 			t.Fatal(err)
 		}

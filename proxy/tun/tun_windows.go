@@ -23,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wintun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
@@ -58,7 +59,7 @@ var _ Tun = (*WindowsTun)(nil)
 // interface with the same name exist, it tried to be reused.
 func NewTun(options *Config) (Tun, error) {
 	// instantiate wintun adapter
-	adapter, err := open(options.Name, options.Desc)
+	adapter, err := open(options.Name, options.Desc, options.GUID)
 	if err != nil {
 		return nil, err
 	}
@@ -81,10 +82,11 @@ func NewTun(options *Config) (Tun, error) {
 	return tun, nil
 }
 
-func open(name, desc string) (*wintun.Adapter, error) {
-	// generate a deterministic GUID from the adapter name
-	id := md5.Sum([]byte(name))
-	guid := (*windows.GUID)(unsafe.Pointer(&id[0]))
+func open(name, desc, id string) (*wintun.Adapter, error) {
+	guid, err := adapterGUID(name, id)
+	if err != nil {
+		return nil, err
+	}
 	// try to open existing adapter by name
 	adapter, err := wintun.OpenAdapter(name)
 	if err == nil {
@@ -96,6 +98,41 @@ func open(name, desc string) (*wintun.Adapter, error) {
 		return adapter, nil
 	}
 	return nil, err
+}
+
+// adapterGUID returns the GUID that an adapter created with the given name is
+// to have: the configured one, if there is one, or else one derived from the name.
+func adapterGUID(name, id string) (*windows.GUID, error) {
+	if id == "" {
+		// generate a deterministic GUID from the adapter name
+		sum := md5.Sum([]byte(name))
+		return (*windows.GUID)(unsafe.Pointer(&sum[0])), nil
+	}
+	raw, err := ParseGUID(id)
+	if err != nil {
+		return nil, err
+	}
+	// the groups are the field values, big-endian in the canonical bytes; Windows
+	// holds them little-endian in memory, which the fields take care of
+	return &windows.GUID{
+		Data1: binary.BigEndian.Uint32(raw[0:4]),
+		Data2: binary.BigEndian.Uint16(raw[4:6]),
+		Data3: binary.BigEndian.Uint16(raw[6:8]),
+		Data4: [8]byte(raw[8:16]),
+	}, nil
+}
+
+// ipv6Off tells whether DisabledComponents turns IPv6 off on the non-tunnel
+// interfaces (0x10, as 0xFF does), the TUN among them. Windows applies it at
+// boot only.
+func ipv6Off() bool {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	value, _, err := key.GetIntegerValue("DisabledComponents")
+	return err == nil && value&0x10 != 0
 }
 
 func (t *WindowsTun) Start() (err error) {
@@ -139,6 +176,17 @@ func (t *WindowsTun) Start() (err error) {
 		routesData = append(routesData, &r)
 	}
 
+	// With IPv6 off by DisabledComponents, setting it up may fail, clearing
+	// its DNS servers too, which is then only logged.
+	off6 := ipv6Off()
+	ignored := func(family winipcfg.AddressFamily, err error) bool {
+		if family != windows.AF_INET6 || !off6 {
+			return false
+		}
+		errors.LogErrorInner(context.Background(), err, "[tun] ignored, as DisabledComponents turns IPv6 off")
+		return true
+	}
+
 	var retryTimes int
 	var firstErr error
 startOver:
@@ -155,6 +203,9 @@ startOver:
 			err = t.luid.SetRoutesForFamily(family, routesData)
 			if err != nil {
 				firstErr = errors.New("unable to set routes").Base(err)
+				if ignored(family, firstErr) {
+					continue
+				}
 				if err == windows.ERROR_NOT_FOUND {
 					goto startOver
 				}
@@ -165,6 +216,9 @@ startOver:
 			err = t.luid.SetIPAddressesForFamily(family, addresses)
 			if err != nil {
 				firstErr = errors.New("unable to set ips").Base(err)
+				if ignored(family, firstErr) {
+					continue
+				}
 				if err == windows.ERROR_NOT_FOUND {
 					goto startOver
 				}
@@ -173,9 +227,7 @@ startOver:
 		}
 		ipif, err := t.luid.IPInterface(family)
 		if err != nil {
-			// With IPv6 disabled system-wide (DisabledComponents), the adapter has no
-			// IPv6 interface at all. Skip the family unless the config asks for it.
-			if err == windows.ERROR_NOT_FOUND && family == windows.AF_INET6 && !address6 && !route6 {
+			if ignored(family, errors.New("unable to get the interface").Base(err)) {
 				continue
 			}
 			return err
@@ -194,6 +246,9 @@ startOver:
 		err = ipif.Set()
 		if err != nil {
 			firstErr = errors.New("unable to set metric and MTU").Base(err)
+			if ignored(family, firstErr) {
+				continue
+			}
 			if err == windows.ERROR_NOT_FOUND {
 				goto startOver
 			}
@@ -202,6 +257,9 @@ startOver:
 		err = t.luid.SetDNS(family, dns, nil)
 		if err != nil {
 			firstErr = errors.New("unable to set DNS").Base(err)
+			if ignored(family, firstErr) {
+				continue
+			}
 			if err == windows.ERROR_NOT_FOUND {
 				goto startOver
 			}
@@ -247,18 +305,25 @@ startOver:
 	}
 
 	// With autoSystemWfpBlockLeak, once the system routes lead to the TUN,
-	// keep connections to the ports given ("dns" stands for those of DNS),
-	// Windows' DNS Client service, and an IP version no route of which leads
-	// to the TUN ("misconfigtun"), from leaving through the other interfaces.
-	// Addresses do not matter: without one of a version in gateway, Windows
-	// gives the TUN a link-local one.
+	// keep the protocols and ports given ("dns" stands for those of DNS),
+	// Windows' DNS Client service, an IP version no route of which leads to
+	// the TUN ("misconfigtun"), or everything ("all", or "allexceptlan" but
+	// for the local network), to the addresses of a CIDR or to all, from
+	// leaving through the other interfaces. The TUN's own addresses do not
+	// matter: without one of a version in gateway, Windows gives it a
+	// link-local one.
 	leaks, err := ExpandWfpBlockLeak(t.options.AutoSystemWfpBlockLeak)
 	if err != nil {
 		return err
 	}
-	block := newLeakFilters(leaks, route4, route6)
+	// With IPv6 off by DisabledComponents, IPv6 setup failures are only logged,
+	// and IPv6 still works until the reboot that applies it. So "misconfigtun"
+	// then blocks IPv6 outside the TUN whatever the routes.
+	block := newLeakFilters(leaks, route4, route6 && !off6)
 	if route4 || route6 {
-		if slices.Contains(leaks, "windnsclient") && !block.dnsClient {
+		dnsClient := func(l leak) bool { return l.name == "windnsclient" }
+		if slices.ContainsFunc(block, dnsClient) && !dnsClientUsesAnyPort() {
+			block = slices.DeleteFunc(block, dnsClient)
 			errors.LogInfo(context.Background(), "[tun] windnsclient skipped: before Windows 11 and Server 2022, the DNS Client service only queries port 53")
 		}
 		if block.systemDNS() && len(dns) == 0 {
@@ -271,19 +336,17 @@ startOver:
 			return errors.New("unable to block ", blocked, " outside the TUN (remove autoSystemWfpBlockLeak to run without)").Base(err)
 		}
 		errors.LogInfo(context.Background(), "[tun] blocked outside the TUN: ", blocked)
-		if block.systemDNS() {
-			covered := slices.Clone(addresses)
-			for _, route := range routesData {
-				covered = append(covered, route.Destination)
-			}
-			for _, server := range dnsOutsideTUN(dns, covered) {
-				errors.LogWarning(context.Background(), "[tun] DNS server ", server, " is in neither gateway nor autoSystemRoutingTable, so queries to it cannot go through the TUN and are blocked")
-			}
-			// With updater, the dialer controllers bind Xray's own sockets
-			// to the physical interface.
-			if updater != nil {
-				t.resolver = resolveOnOwn()
-			}
+		covered := slices.Clone(addresses)
+		for _, route := range routesData {
+			covered = append(covered, route.Destination)
+		}
+		for _, server := range dnsOutsideTUN(dns, covered, block) {
+			errors.LogWarning(context.Background(), "[tun] DNS server ", server, " is in neither gateway nor autoSystemRoutingTable, so queries to it cannot go through the TUN and are blocked")
+		}
+		// With updater, the dialer controllers bind Xray's own sockets to the
+		// physical interface.
+		if block.systemDNS() && updater != nil {
+			t.resolver = resolveOnOwn()
 		}
 	}
 	if len(dns) > 0 || route4 || route6 {
@@ -646,4 +709,110 @@ func findOutboundInterface(tunIndex int, fixedName string) (*net.Interface, erro
 		index = indexWifi
 	}
 	return net.InterfaceByIndex(int(index))
+}
+
+// outboundGuard keeps Windows to the binding of autoOutboundsInterface, which
+// keeps Xray's own connections out of the TUN. With weak host send or
+// forwarding on for an IP version on the bound interface, Windows sends them
+// where the routes lead, into the TUN, from that interface's address, and
+// drops what comes back to that address through the TUN, so they stall.
+//
+// For the IP versions routed to the TUN, weak host send is turned off on the
+// bound interface while the TUN runs, and turned on again when the TUN stops
+// or another interface takes over. Forwarding is what Mobile Hotspot and
+// Internet Connection Sharing need, so it is only reported.
+type outboundGuard struct {
+	sync.Mutex
+	families   []winipcfg.AddressFamily
+	luid       winipcfg.LUID            // of the interface last checked
+	name       string                   // of that interface
+	turnedOff  []winipcfg.AddressFamily // where weak host send was turned off on it
+	forwarding bool                     // whether forwarding was on there
+	stopped    bool
+}
+
+// check turns weak host send off on the bound interface, and warns when
+// forwarding comes on there, but not again while it stays on.
+func (g *outboundGuard) check() {
+	g.Lock()
+	defer g.Unlock()
+	if g.stopped {
+		return
+	}
+	var luid winipcfg.LUID
+	var name string
+	if iface := updater.Get(); iface != nil {
+		luid, _ = winipcfg.LUIDFromIndex(uint32(iface.Index))
+		name = iface.Name
+	}
+	if luid != g.luid {
+		g.restoreLocked()
+		g.luid, g.name = luid, name
+		g.forwarding = false // to warn about the new interface as well
+	}
+	if luid == 0 {
+		return
+	}
+	var forwarding []string
+	for _, family := range g.families {
+		row, err := luid.IPInterface(family)
+		if err != nil {
+			continue // the interface lacks that IP version
+		}
+		if row.ForwardingEnabled {
+			forwarding = append(forwarding, familyName(family))
+		}
+		if !row.WeakHostSend {
+			continue
+		}
+		if err := setWeakHostSend(row, false); err != nil {
+			errors.LogWarningInner(context.Background(), err, "[tun] unable to turn weak host send off for ", familyName(family), " on ", name)
+			continue
+		}
+		if !slices.Contains(g.turnedOff, family) {
+			g.turnedOff = append(g.turnedOff, family)
+			errors.LogInfo(context.Background(), "[tun] weak host send turned off for ", familyName(family), " on ", name, " while the TUN runs, as Windows would ignore autoOutboundsInterface")
+		}
+	}
+	wasOn := g.forwarding
+	g.forwarding = len(forwarding) > 0
+	if g.forwarding && !wasOn {
+		errors.LogWarning(context.Background(), "[tun] forwarding is on for ", strings.Join(forwarding, " and "), " on ", name, " (Mobile Hotspot and Internet Connection Sharing turn it on), so Windows ignores autoOutboundsInterface there, and Xray's own connections go into the TUN and stall: turn the hotspot off, or have it share the TUN instead of ", name)
+	}
+}
+
+// restore turns weak host send on again where check turned it off, for good.
+func (g *outboundGuard) restore() {
+	g.Lock()
+	defer g.Unlock()
+	g.restoreLocked()
+	g.stopped = true
+}
+
+func (g *outboundGuard) restoreLocked() {
+	for _, family := range g.turnedOff {
+		row, err := g.luid.IPInterface(family)
+		if err == nil {
+			err = setWeakHostSend(row, true)
+		}
+		if err != nil {
+			errors.LogWarningInner(context.Background(), err, "[tun] unable to turn weak host send on again for ", familyName(family), " on ", g.name)
+		}
+	}
+	g.turnedOff = nil
+}
+
+func setWeakHostSend(row *winipcfg.MibIPInterfaceRow, on bool) error {
+	row.WeakHostSend = on
+	if row.Family == windows.AF_INET {
+		row.SitePrefixLength = 0 // as SetIpInterfaceEntry requires for IPv4
+	}
+	return row.Set()
+}
+
+func familyName(family winipcfg.AddressFamily) string {
+	if family == windows.AF_INET {
+		return "IPv4"
+	}
+	return "IPv6"
 }

@@ -13,7 +13,6 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
@@ -60,9 +59,6 @@ type Handler struct {
 	streamSettings  *internet.MemoryStreamConfig
 	proxyConfig     proto.Message
 	proxy           proxy.Outbound
-	mux             *mux.ClientManager
-	xudp            *mux.ClientManager
-	udp443          string
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
@@ -122,56 +118,6 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 		return nil, errors.New("not an outbound handler")
 	}
 
-	if h.senderSettings != nil && h.senderSettings.MultiplexSettings != nil {
-		if config := h.senderSettings.MultiplexSettings; config.Enabled {
-			if config.Concurrency < 0 {
-				h.mux = &mux.ClientManager{Enabled: false}
-			}
-			if config.Concurrency == 0 {
-				config.Concurrency = 8 // same as before
-			}
-			if config.Concurrency > 0 {
-				h.mux = &mux.ClientManager{
-					Enabled: true,
-					Picker: &mux.IncrementalWorkerPicker{
-						Factory: &mux.DialingWorkerFactory{
-							Proxy:   proxyHandler,
-							Dialer:  h,
-							Context: h.ctx,
-							Strategy: mux.ClientStrategy{
-								MaxConcurrency: uint32(config.Concurrency),
-								MaxConnection:  128,
-							},
-						},
-					},
-				}
-			}
-			if config.XudpConcurrency < 0 {
-				h.xudp = &mux.ClientManager{Enabled: false}
-			}
-			if config.XudpConcurrency == 0 {
-				h.xudp = nil // same as before
-			}
-			if config.XudpConcurrency > 0 {
-				h.xudp = &mux.ClientManager{
-					Enabled: true,
-					Picker: &mux.IncrementalWorkerPicker{
-						Factory: &mux.DialingWorkerFactory{
-							Proxy:   proxyHandler,
-							Dialer:  h,
-							Context: h.ctx,
-							Strategy: mux.ClientStrategy{
-								MaxConcurrency: uint32(config.XudpConcurrency),
-								MaxConnection:  128,
-							},
-						},
-					},
-				}
-			}
-			h.udp443 = config.XudpProxyUDP443
-		}
-	}
-
 	h.proxy = proxyHandler
 	return h, nil
 }
@@ -192,65 +138,44 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 	})()
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
-	content := session.ContentFromContext(ctx)
-	if h.senderSettings != nil && h.senderSettings.TargetStrategy.HasStrategy() && ob.Target.Address.Family().IsDomain() && (content == nil || !content.SkipDNSResolve) {
-		strategy := h.senderSettings.TargetStrategy
-		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
-			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-		}
-		ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
-		if err != nil {
-			errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
-			if h.senderSettings.TargetStrategy.ForceIP() {
-				err := errors.New("failed to resolve ip for target ", ob.Target.Address.Domain()).Base(err)
-				session.SubmitOutboundErrorToOriginator(ctx, err)
-				common.Interrupt(link.Writer)
-				common.Interrupt(link.Reader)
-				return
-			}
+	if h.senderSettings != nil && h.senderSettings.TargetStrategy.HasStrategy() && ob.Target.Address.Family().IsDomain() {
+		if session.SkipDNSResolveFromContext(ctx) {
+			errors.LogInfo(ctx, "bypassing targetStrategy ", h.senderSettings.TargetStrategy, " for ", ob.Target, "; preserving target domain")
 		} else {
-			unchangedDomain := ob.Target.Address.Domain()
-			ob.Target.Address = net.IPAddress(ips[dice.Roll(len(ips))])
-			errors.LogInfo(ctx, "target: ", unchangedDomain, " resolved to: ", ob.Target.Address.String())
+			strategy := h.senderSettings.TargetStrategy
+			if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
+				strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
+			}
+			ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
+			if err != nil {
+				errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
+				if h.senderSettings.TargetStrategy.ForceIP() {
+					err := errors.New("failed to resolve ip for target ", ob.Target.Address.Domain()).Base(err)
+					session.SubmitOutboundErrorToOriginator(ctx, err)
+					common.Interrupt(link.Writer)
+					common.Interrupt(link.Reader)
+					return
+				}
+			} else {
+				unchangedDomain := ob.Target.Address.Domain()
+				ob.Target.Address = net.IPAddress(ips[dice.Roll(len(ips))])
+				errors.LogInfo(ctx, "target: ", unchangedDomain, " resolved to: ", ob.Target.Address.String())
+			}
 		}
 	}
+	reader, writer := link.Reader, link.Writer
 	if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil && ob.OriginalTarget.Address != ob.Target.Address {
 		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
 		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
 	}
-	if h.mux != nil {
-		test := func(err error) {
-			if err != nil {
-				err := errors.New("failed to process mux outbound traffic").Base(err)
-				session.SubmitOutboundErrorToOriginator(ctx, err)
-				errors.LogInfo(ctx, err.Error())
-				common.Interrupt(link.Writer)
-				common.Interrupt(link.Reader)
-			}
-		}
-		if ob.Target.Network == net.Network_UDP && ob.Target.Port == 443 {
-			switch h.udp443 {
-			case "reject":
-				test(errors.New("XUDP rejected UDP/443 traffic"))
-				return
-			case "skip":
-				goto out
-			}
-		}
-		if h.xudp != nil && ob.Target.Network == net.Network_UDP {
-			if !h.xudp.Enabled {
-				goto out
-			}
-			test(h.xudp.Dispatch(ctx, link))
-			return
-		}
-		if h.mux.Enabled {
-			test(h.mux.Dispatch(ctx, link))
-			return
-		}
-	}
-out:
+
 	err := h.proxy.Process(ctx, link, h)
+	var completion interface{ DeferWriterClose() bool }
+	if goerrors.As(err, &completion) && completion.DeferWriterClose() {
+		go common.Close(writer)
+		common.Interrupt(reader)
+		return
+	}
 	var errC error
 	if err != nil {
 		errC = errors.Cause(err)
@@ -263,15 +188,15 @@ out:
 		err := errors.New("failed to process outbound traffic").Base(err)
 		session.SubmitOutboundErrorToOriginator(ctx, err)
 		errors.LogInfo(ctx, err.Error())
-		common.Interrupt(link.Writer)
+		common.Interrupt(writer)
 	} else {
 		if errC != nil && goerrors.Is(errC, io.ErrClosedPipe) {
-			common.Interrupt(link.Writer)
+			common.Interrupt(writer)
 		} else {
-			common.Close(link.Writer)
+			common.Close(writer)
 		}
 	}
-	common.Interrupt(link.Reader)
+	common.Interrupt(reader)
 }
 
 func (h *Handler) DestIpAddress() net.IP {
@@ -344,7 +269,6 @@ func (h *Handler) Start() error {
 // Close implements common.Closable.
 func (h *Handler) Close() error {
 	h.cancel()
-	common.Close(h.mux)
 	common.Close(h.proxy)
 	return nil
 }
