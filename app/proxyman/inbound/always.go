@@ -81,7 +81,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		return nil, errors.New("not an inbound proxy.")
 	}
 
-	dispatcher := new(struct{ routing.Dispatcher })
+	dispatcher := new(legacyMuxDispatcher)
 	if err := core.RequireFeatures(ctx, func(d routing.Dispatcher) { dispatcher.Dispatcher = d }); err != nil {
 		return nil, err
 	}

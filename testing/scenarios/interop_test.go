@@ -139,7 +139,9 @@ func TestUpstreamClient(t *testing.T) {
 		{name: "VMessWebSocketMux", server: func(port net.Port) obj {
 			return obj{"protocol": "vmess", "settings": obj{"clients": []obj{{"id": id}}}, "streamSettings": stream("ws", "", nil)}
 		}, client: func(port net.Port) obj {
-			return with(vnext("vmess", port, obj{"id": id, "security": "chacha20-poly1305"}), "streamSettings", stream("ws", "", nil),
+			outbound := vnext("vmess", port, obj{"id": id, "security": "chacha20-poly1305"})
+			outbound["settings"].(obj)["multiplex"] = obj{"concurrency": 8}
+			return with(outbound, "streamSettings", stream("ws", "", nil),
 				"mux", obj{"enabled": true, "concurrency": 8})
 		}},
 		{name: "TrojanTLS", server: func(port net.Port) obj {

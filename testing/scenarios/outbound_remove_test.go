@@ -111,7 +111,7 @@ func TestRemoveOutboundMux(t *testing.T) {
 		{"tag": "ss", "listen": "127.0.0.1", "port": %d, "protocol": "shadowsocks", "settings": {"method": "aes-128-gcm", "password": "pass", "network": "tcp"}}
 	],
 	"outbounds": [
-		{"tag": "out", "protocol": "vless", "settings": {"address": "127.0.0.1", "port": %d, "id": "%s", "encryption": "none"}, "mux": {"enabled": true}},
+		{"tag": "out", "protocol": "vless", "settings": {"address": "127.0.0.1", "port": %d, "id": "%s", "encryption": "none", "multiplex": {"concurrency": 8}}},
 		{"tag": "hop", "protocol": "shadowsocks", "settings": {"address": "127.0.0.1", "port": %d, "method": "aes-128-gcm", "password": "pass"}}
 	],
 	"routing": {"rules": [
