@@ -24,7 +24,6 @@ import (
 	_ "github.com/xtls/xray-core/app/log"
 	_ "github.com/xtls/xray-core/app/metrics"
 	_ "github.com/xtls/xray-core/app/policy"
-	_ "github.com/xtls/xray-core/app/reverse"
 	_ "github.com/xtls/xray-core/app/router"
 	_ "github.com/xtls/xray-core/app/stats"
 
@@ -35,7 +34,6 @@ import (
 	_ "github.com/xtls/xray-core/app/observatory"
 
 	// Inbound and outbound proxies.
-	_ "github.com/xtls/xray-core/proxy/blackhole"
 	_ "github.com/xtls/xray-core/proxy/dns"
 	_ "github.com/xtls/xray-core/proxy/dokodemo"
 	_ "github.com/xtls/xray-core/proxy/freedom"

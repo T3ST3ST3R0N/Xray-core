@@ -148,7 +148,7 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		}
 		// Resolve like the peer endpoints, with Xray's DNS, not the system's.
 		if dest.Address.Family().IsDomain() {
-			ip, err := bind.resolveFunc(dest.Address.Domain())
+			ip, err := bind.resolveFunc(ctx, dest.Address.Domain())
 			if err != nil {
 				return nil, err
 			}
@@ -332,12 +332,12 @@ func (h *Handler) up(ctx context.Context) error {
 	return h.dev.Up()
 }
 
-func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig) func(host string) (net.IP, error) {
-	return func(host string) (net.IP, error) {
+func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig) func(ctx context.Context, host string) (net.IP, error) {
+	return func(ctx context.Context, host string) (net.IP, error) {
 		if ip := net.ParseIP(host); ip != nil {
 			return ip, nil
 		}
-		ips, _, err := d.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
+		ips, err := lookupIPContext(ctx, d, host)
 		if err != nil {
 			return nil, err
 		}
@@ -376,6 +376,27 @@ func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig)
 			return nil, dns.ErrEmptyResponse
 		}
 		return got[dice.Roll(len(got))], nil
+	}
+}
+
+func lookupIPContext(ctx context.Context, d dns.Client, host string) ([]net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		ips []net.IP
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ips, _, err := d.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
+		done <- result{ips, err}
+	}()
+	select {
+	case r := <-done:
+		return r.ips, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

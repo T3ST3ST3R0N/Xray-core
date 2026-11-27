@@ -7,6 +7,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/proxy/tun"
@@ -16,6 +17,7 @@ import (
 type TunConfig struct {
 	Name                   string   `json:"name"`
 	Desc                   string   `json:"desc"`
+	GUID                   string   `json:"guid"`
 	MTU                    uint32   `json:"mtu"`
 	Gateway                []string `json:"gateway"`
 	DNS                    []string `json:"dns"`
@@ -37,6 +39,13 @@ func (v *TunConfig) Build() (proto.Message, error) {
 		AutoSystemRoutingTable: v.AutoSystemRoutingTable,
 		AutoSystemDnsToGateway: v.AutoSystemDnsToGateway,
 	}
+	if v.GUID != "" {
+		// only Windows gives the TUN a GUID, but a config is checked wherever it is loaded
+		if _, err := tun.ParseGUID(v.GUID); err != nil {
+			return nil, err
+		}
+		config.GUID = strings.ToLower(v.GUID)
+	}
 	leaks, err := tun.ExpandWfpBlockLeak(v.AutoSystemWfpBlockLeak)
 	if err != nil {
 		return nil, err
@@ -52,7 +61,7 @@ func (v *TunConfig) Build() (proto.Message, error) {
 			return nil, errors.New("autoSystemWfpBlockLeak needs autoSystemRoutingTable to be set")
 		}
 		if tun.BlocksSystemDNS(leaks) && len(v.DNS) == 0 {
-			return nil, errors.New(`autoSystemWfpBlockLeak "dns", "udp/53", "tcp/53" or "windnsclient" needs dns to be set`)
+			return nil, errors.New(`autoSystemWfpBlockLeak "all", "allexceptlan", "dns", "windnsclient", or TCP or UDP port 53, needs dns to be set`)
 		}
 	case "linux", "freebsd":
 		if v.AutoSystemDnsToGateway && len(v.Gateway) == 0 {
