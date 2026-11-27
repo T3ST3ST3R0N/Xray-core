@@ -156,6 +156,10 @@ func main() {
 		}
 
 		if info.IsDir() {
+			// Preserve the formatting of the imported REALITY module.
+			if path == filepath.Join(pwd, "third_party", "reality") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
