@@ -68,3 +68,5 @@ tool (
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc
 	google.golang.org/protobuf/cmd/protoc-gen-go
 )
+
+replace github.com/xtls/reality v0.0.0-20261108101329-4bb46b2afd8b => ./third_party/reality
